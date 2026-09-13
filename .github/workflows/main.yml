@@ -1,0 +1,54 @@
+name: Sparta Arena APK Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repository indir
+        uses: actions/checkout@v4
+
+      - name: Java kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Gerekli paketleri kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip git zip unzip
+
+      - name: ZIP dosyasını bul ve çıkar
+        run: |
+          ZIP_FILE=$(find . -name "*.zip" | head -n 1)
+          echo "Bulunan ZIP: $ZIP_FILE"
+          unzip -o "$ZIP_FILE" -d project
+
+      - name: Proje dosyalarını kontrol et
+        run: |
+          find project -maxdepth 3 -type f | head -100
+
+      - name: APK dosyalarını ara
+        run: |
+          find project -type f \( -name "*.apk" -o -name "*.aab" \)
+
+      - name: APK sonucu yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sparta-Arena-APK
+          path: |
+            project/**/*.apk
+            project/**/*.aab
+          if-no-files-found: warn
