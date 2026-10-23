@@ -8,7 +8,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
 
     steps:
       - name: Repository indir
@@ -28,27 +29,39 @@ jobs:
       - name: Gerekli paketleri kur
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pip git zip unzip
+          sudo apt-get install -y git zip unzip build-essential autoconf automake libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo6 cmake libffi-dev libssl-dev
 
       - name: ZIP dosyasını bul ve çıkar
         run: |
-          ZIP_FILE=$(find . -name "*.zip" | head -n 1)
-          echo "Bulunan ZIP: $ZIP_FILE"
-          unzip -o "$ZIP_FILE" -d project
+          ZIP_FILE="$(find . -maxdepth 2 -iname '*.zip' -print -quit)"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "HATA: ZIP dosyası bulunamadı"
+            exit 1
+          fi
+          mkdir -p unpacked
+          unzip -q "$ZIP_FILE" -d unpacked
+          find unpacked -name buildozer.spec -print
 
-      - name: Proje dosyalarını kontrol et
+      - name: Buildozer kur
         run: |
-          find project -maxdepth 3 -type f | head -100
+          python -m pip install --upgrade pip
+          pip install buildozer cython==0.29.37
 
-      - name: APK dosyalarını ara
+      - name: APK derle
         run: |
-          find project -type f \( -name "*.apk" -o -name "*.aab" \)
+          SPEC="$(find unpacked -name buildozer.spec -print -quit)"
+          if [ -z "$SPEC" ]; then
+            echo "HATA: buildozer.spec bulunamadı"
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$SPEC")"
+          cd "$PROJECT_DIR"
+          buildozer -v android debug
 
-      - name: APK sonucu yükle
+      - name: APK dosyasını yükle
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Sparta-Arena-APK
-          path: |
-            project/**/*.apk
-            project/**/*.aab
+          path: unpacked/**/bin/*.apk
           if-no-files-found: warn
