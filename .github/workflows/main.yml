@@ -19,6 +19,11 @@ jobs:
       - name: Depoyu indir
         uses: actions/checkout@v4
 
+      - name: Log ve cikti klasorlerini hazirla
+        run: |
+          mkdir -p apk-output
+          touch build.log
+
       - name: Java 17 kur
         uses: actions/setup-java@v4
         with:
@@ -33,7 +38,7 @@ jobs:
       - name: Android SDK kur
         uses: android-actions/setup-android@v4
 
-      - name: Android SDK yolunu ve lisanslari duzelt
+      - name: Android SDK ve sdkmanager duzelt
         shell: bash
         run: |
           set -eux
@@ -46,7 +51,7 @@ jobs:
 
           if [ -z "$SDKMANAGER" ]; then
             echo "HATA: sdkmanager bulunamadi."
-            find "$SDK" -maxdepth 6 -iname '*sdkmanager*' -print || true
+            find "$SDK" -maxdepth 7 -iname '*sdkmanager*' -print || true
             exit 1
           fi
 
@@ -55,7 +60,13 @@ jobs:
           ln -sf "$SDKMANAGER" "$SDK/tools/bin/sdkmanager"
 
           yes | "$SDKMANAGER" --licenses || true
-          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;35.0.0" "ndk;25.1.8937393"
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;35.0.0" \
+            "ndk;25.1.8937393"
+
+          test -x "$SDK/tools/bin/sdkmanager"
 
       - name: Sistem bagimliliklarini kur
         run: |
@@ -67,39 +78,43 @@ jobs:
             libtinfo6 cmake libffi-dev libssl-dev \
             libltdl-dev
 
-      - name: Proje ZIP dosyasini bul ve ac
+      - name: Proje ZIP dosyasini ac
         shell: bash
         run: |
           set -eux
 
-          ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' -not -path './.git/*' -print -quit)"
+          ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' \
+            -not -path './.git/*' -print -quit)"
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "HATA: Depoda ZIP dosyasi bulunamadi."
+            echo "HATA: Depoda proje ZIP dosyasi bulunamadi."
             exit 1
           fi
 
-          echo "ZIP: $ZIP_FILE"
           mkdir -p unpacked
           unzip -oq "$ZIP_FILE" -d unpacked
 
           SPEC="$(find unpacked -name buildozer.spec -print -quit)"
           if [ -z "$SPEC" ]; then
             echo "HATA: ZIP icinde buildozer.spec bulunamadi."
-            find unpacked -maxdepth 4 -type f | head -200
+            find unpacked -maxdepth 5 -type f | head -200
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$SPEC")"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Proje klasoru: $PROJECT_DIR"
-
           find "$PROJECT_DIR" -maxdepth 3 -type f | head -200
 
       - name: Buildozer ve Cython kur
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install "Cython>=3.1,<3.2" "buildozer==1.5.0"
+          python -m pip install \
+            "Cython>=3.1,<3.2" \
+            "buildozer==1.5.0"
+
+          cython --version
+          buildozer --version
 
       - name: Buildozer ayarlarini duzenle
         shell: bash
@@ -111,16 +126,28 @@ jobs:
           from pathlib import Path
           import os
 
-          path = Path("buildozer.spec")
-          content = path.read_text(encoding="utf-8")
+          spec = Path("buildozer.spec")
+          content = spec.read_text(encoding="utf-8")
+          lines = content.splitlines()
 
-          if "[app]" not in content:
-              raise SystemExit("HATA: buildozer.spec icinde [app] bolumu yok.")
+          if "[app]" not in lines:
+              raise SystemExit("HATA: [app] bolumu bulunamadi.")
 
-          source_dir = "app" if Path("app/main.py").exists() else "."
+          start = lines.index("[app]")
+          end = next(
+              (i for i in range(start + 1, len(lines))
+               if lines[i].strip().startswith("[")
+               and lines[i].strip().endswith("]")),
+              len(lines)
+          )
+
+          section = lines[start + 1:end]
+          source_dir = "app" if Path("app/main.py").is_file() else "."
+
           settings = {
               "source.dir": source_dir,
               "p4a.branch": "v2024.01.21",
+              "p4a.local_recipes": "./p4a-recipes",
               "android.accept_sdk_license": "True",
               "android.sdk_path": os.environ["ANDROID_HOME"],
               "android.ndk_path": os.path.join(
@@ -131,15 +158,6 @@ jobs:
               "android.build_tools_version": "35.0.0",
           }
 
-          lines = content.splitlines()
-          start = lines.index("[app]")
-          end = next(
-              (i for i in range(start + 1, len(lines))
-               if lines[i].strip().startswith("[") and lines[i].strip().endswith("]")),
-              len(lines)
-          )
-
-          section = lines[start + 1:end]
           for key, value in settings.items():
               section = [
                   line for line in section
@@ -148,13 +166,13 @@ jobs:
               section.append(f"{key} = {value}")
 
           lines = lines[:start + 1] + section + lines[end:]
-          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          spec.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-          print("buildozer.spec ayarlari guncellendi.")
-          print(path.read_text(encoding="utf-8"))
+          print("Guncellenen buildozer.spec:")
+          print(spec.read_text(encoding="utf-8"))
           PY
 
-      - name: Pygame icin yerel recipe hazirla
+      - name: Pygame 2.6.1 yerel tarifini olustur
         shell: bash
         run: |
           set -eux
@@ -162,38 +180,48 @@ jobs:
           mkdir -p p4a-recipes/pygame
 
           cat > p4a-recipes/pygame/__init__.py <<'PY'
+          import sh
           from pythonforandroid.recipes.pygame import Pygame2Recipe
+          from pythonforandroid.toolchain import current_directory
+          from pythonforandroid.logger import shprint
 
           class Pygame261Recipe(Pygame2Recipe):
               version = "2.6.1"
               url = "https://github.com/pygame/pygame/archive/refs/tags/{version}.tar.gz"
               hostpython_prerequisites = ["setuptools", "cython>=3.1"]
 
+              def build_compiled_components(self, arch):
+                  build_dir = self.get_build_dir(arch.arch)
+                  env = self.get_recipe_env(arch)
+
+                  with current_directory(build_dir):
+                      hostpython = sh.Command(self.ctx.hostpython)
+
+                      try:
+                          shprint(
+                              hostpython, "setup.py", "build_ext",
+                              _env=env
+                          )
+                      except sh.ErrorReturnCode:
+                          print(
+                              "Ilk build_ext denemesi basarisiz; "
+                              "Cython dosyalari olusturulacak.",
+                              flush=True
+                          )
+
+                      shprint(
+                          sh.find, build_dir,
+                          "-iname", "*.pyx",
+                          "-exec", self.ctx.cython, "{}", ";",
+                          _env=env
+                      )
+
+                      super().build_compiled_components(arch)
+
           recipe = Pygame261Recipe()
           PY
 
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path("buildozer.spec")
-          lines = path.read_text(encoding="utf-8").splitlines()
-          start = lines.index("[app]")
-          end = next(
-              (i for i in range(start + 1, len(lines))
-               if lines[i].strip().startswith("[") and lines[i].strip().endswith("]")),
-              len(lines)
-          )
-
-          section = lines[start + 1:end]
-          key = "p4a.local_recipes"
-          section = [
-              line for line in section
-              if not line.strip().startswith(key + " =")
-          ]
-          section.append("p4a.local_recipes = ./p4a-recipes")
-          lines = lines[:start + 1] + section + lines[end:]
-          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-          PY
+          python -m py_compile p4a-recipes/pygame/__init__.py
 
       - name: Eski derleme dosyalarini temizle
         shell: bash
@@ -201,19 +229,36 @@ jobs:
           cd "$PROJECT_DIR"
           rm -rf .buildozer bin
 
-      - name: APK derle
+      - name: APK derle ve log kaydet
         shell: bash
         run: |
           set -o pipefail
           cd "$PROJECT_DIR"
-          buildozer -v android debug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
-      - name: APK ve hata logunu yukle
+          buildozer -v android debug 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build.log"
+
+          find "$PROJECT_DIR/bin" -type f -name '*.apk' \
+            -exec cp {} "$GITHUB_WORKSPACE/apk-output/" \;
+
+          if ! find "$GITHUB_WORKSPACE/apk-output" \
+            -maxdepth 1 -type f -name '*.apk' | grep -q .; then
+            echo "HATA: Derleme bitti ancak APK bulunamadi."
+            exit 1
+          fi
+
+      - name: APK dosyalarini yukle
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Sparta-Arena-Build-Files
-          path: |
-            unpacked/**/bin/*.apk
-            build.log
+          name: Sparta-Arena-APK
+          path: apk-output/*.apk
+          if-no-files-found: warn
+
+      - name: Derleme gunlugunu yukle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sparta-Arena-Build-Log
+          path: build.log
           if-no-files-found: warn
