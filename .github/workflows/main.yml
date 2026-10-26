@@ -4,8 +4,7 @@ name: Sparta Arena APK Build
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
 
 permissions:
   contents: read
@@ -16,7 +15,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Get project
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set Java
@@ -30,152 +29,190 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install system packages
+      - name: Setup Android SDK and accept licenses
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+              -type f -name sdkmanager -print -quit)"
+          fi
+
+          test -x "$SDKMANAGER"
+
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses || true
+
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;35.0.0" \
+            "ndk;25.1.8937393"
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/25.1.8937393" >> "$GITHUB_ENV"
+
+      - name: Install Linux packages
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git zip unzip \
-            build-essential autoconf automake libtool \
-            pkg-config zlib1g-dev libncurses5-dev \
-            libncursesw5-dev libtinfo6 cmake \
-            libffi-dev libssl-dev
+            git zip unzip build-essential \
+            autoconf automake libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev \
+            libtinfo6 cmake libffi-dev libssl-dev
 
-      - name: Find and extract Sparta project
+      - name: Extract project
         shell: bash
         run: |
           set -euo pipefail
 
           ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' -print -quit)"
-
           if [ -z "$ZIP_FILE" ]; then
-            echo "HATA: Depoda proje ZIP dosyasi bulunamadi."
+            echo "HATA: Proje ZIP dosyasi bulunamadi."
             exit 1
           fi
 
-          echo "ZIP: $ZIP_FILE"
           mkdir -p unpacked
           unzip -q "$ZIP_FILE" -d unpacked
 
           SPEC="$(find unpacked -type f -name buildozer.spec -print -quit)"
-
           if [ -z "$SPEC" ]; then
-            echo "HATA: ZIP icinde buildozer.spec bulunamadi."
+            echo "HATA: buildozer.spec bulunamadi."
             exit 1
           fi
 
-          PROJECT_DIR="$(dirname "$SPEC")"
-          PROJECT_DIR="$(realpath "$PROJECT_DIR")"
+          PROJECT_DIR="$(dirname "$(realpath "$SPEC")")"
 
           echo "SPEC=$SPEC" >> "$GITHUB_ENV"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          echo "Proje klasoru: $PROJECT_DIR"
+          echo "Proje: $PROJECT_DIR"
           find "$PROJECT_DIR" -maxdepth 3 -name main.py -print
 
-      - name: Configure Pygame recipe
+      - name: Configure buildozer and Pygame
         shell: bash
         run: |
           set -euo pipefail
-
-          test -f "$SPEC"
 
           if [ -f "$PROJECT_DIR/app/main.py" ]; then
             SOURCE_DIR="app"
           elif [ -f "$PROJECT_DIR/main.py" ]; then
             SOURCE_DIR="."
           else
-            MAIN_FILE="$(find "$PROJECT_DIR" \
-              -path '*/.buildozer/*' -prune -o \
-              -path '*/backend/*' -prune -o \
-              -type f -name main.py -print -quit)"
-
-            if [ -z "$MAIN_FILE" ]; then
-              echo "HATA: Oyun main.py dosyasi bulunamadi."
-              exit 1
-            fi
-
-            SOURCE_DIR="${MAIN_FILE#"$PROJECT_DIR"/}"
-            SOURCE_DIR="$(dirname "$SOURCE_DIR")"
-            [ "$SOURCE_DIR" = "." ] || true
+            echo "HATA: Beklenen app/main.py veya main.py bulunamadi."
+            exit 1
           fi
 
           mkdir -p "$PROJECT_DIR/p4a-recipes/pygame"
 
           cat > "$PROJECT_DIR/p4a-recipes/pygame/__init__.py" <<'PYRECIPE'
-          from pathlib import Path
           import subprocess
+          from pathlib import Path
 
           from pythonforandroid.recipes.pygame import Pygame2Recipe
+          from pythonforandroid.util import current_directory, shprint
+          import sh
 
           class Pygame261Recipe(Pygame2Recipe):
               version = "2.6.1"
-              url = "https://github.com/pygame/pygame/archive/{version}.tar.gz"
+              url = "https://github.com/pygame/pygame/archive/refs/tags/{version}.tar.gz"
               hostpython_prerequisites = ["setuptools", "cython>=3.1"]
 
               def build_compiled_components(self, arch):
                   build_dir = Path(self.get_build_dir(arch.arch))
                   env = self.get_recipe_env(arch)
 
-                  pyx_files = list(build_dir.rglob("*.pyx"))
+                  with current_directory(str(build_dir)):
+                      hostpython = sh.Command(self.ctx.hostpython)
 
-                  if pyx_files:
-                      cython = self.ctx.cython
-                      print(
-                          "Cython ile {} kaynak dosyasi hazirlaniyor".format(
-                              len(pyx_files)
-                          ),
-                          flush=True,
-                      )
+                      # Ilk deneme .pyx dosyalarinin olusmasina yardimci olabilir.
+                      try:
+                          shprint(
+                              hostpython,
+                              "setup.py",
+                              "build_ext",
+                              _env=env,
+                          )
+                      except sh.ErrorReturnCode:
+                          print(
+                              "Ilk build_ext denemesi basarisiz; "
+                              "Cython adimina geciliyor.",
+                              flush=True,
+                          )
+
+                      pyx_files = list(build_dir.rglob("*.pyx"))
+                      if not pyx_files:
+                          raise RuntimeError(
+                              "Pygame kaynaklarinda .pyx dosyasi bulunamadi."
+                          )
 
                       for pyx_file in pyx_files:
                           print("Cython:", pyx_file, flush=True)
                           subprocess.run(
-                              [cython, str(pyx_file)],
+                              [str(self.ctx.cython), "-3", str(pyx_file)],
                               cwd=str(build_dir),
                               env=env,
                               check=True,
                           )
 
-                  super().build_compiled_components(arch)
+                      # C kaynaklari olustuktan sonra normal derlemeyi yap.
+                      super().build_compiled_components(arch)
 
           recipe = Pygame261Recipe()
           PYRECIPE
 
-          python - "$SPEC" "$SOURCE_DIR" <<'PYCONFIG'
+          python - "$SPEC" "$SOURCE_DIR" "$ANDROID_HOME" <<'PYCONFIG'
           import sys
           from pathlib import Path
 
           spec = Path(sys.argv[1])
           source_dir = sys.argv[2]
-          lines = spec.read_text(encoding="utf-8").splitlines()
+          sdk = sys.argv[3]
+          ndk = sdk + "/ndk/25.1.8937393"
 
+          replacements = {
+              "source.dir": "source.dir = " + source_dir,
+              "p4a.branch": "p4a.branch = v2024.01.21",
+              "p4a.local_recipes": "p4a.local_recipes = ./p4a-recipes",
+              "android.accept_sdk_license": "android.accept_sdk_license = True",
+              "android.sdk_path": "android.sdk_path = " + sdk,
+              "android.ndk_path": "android.ndk_path = " + ndk,
+              "android.api": "android.api = 34",
+              "android.minapi": "android.minapi = 24",
+              "android.build_tools_version": "android.build_tools_version = 35.0.0",
+          }
+
+          lines = spec.read_text(encoding="utf-8").splitlines()
           start = next(
               (i for i, line in enumerate(lines)
                if line.strip().lower() == "[app]"),
-              None
+              None,
           )
 
           if start is None:
-              raise SystemExit("HATA: buildozer.spec icinde [app] bolumu yok.")
+              raise SystemExit("HATA: buildozer.spec icinde [app] yok.")
 
           end = len(lines)
           for i in range(start + 1, len(lines)):
-              if lines[i].strip().startswith("[") and lines[i].strip().endswith("]"):
+              line = lines[i].strip()
+              if line.startswith("[") and line.endswith("]"):
                   end = i
                   break
-
-          replacements = {
-              "p4a.branch": "p4a.branch = v2024.01.21",
-              "p4a.local_recipes": "p4a.local_recipes = ./p4a-recipes",
-              "source.dir": "source.dir = " + source_dir,
-          }
 
           section = []
           seen = set()
 
           for line in lines[start + 1:end]:
               stripped = line.strip()
-              key = stripped.split("=", 1)[0].strip().lower() if "=" in stripped else ""
+              key = (
+                  stripped.split("=", 1)[0].strip().lower()
+                  if "=" in stripped else ""
+              )
 
               if key in replacements:
                   if key not in seen:
@@ -192,47 +229,37 @@ jobs:
           lines = lines[:start + 1] + section + lines[end:]
           spec.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-          print("buildozer.spec guncellendi:")
-          print("source.dir =", source_dir)
-          print("p4a.branch = v2024.01.21")
-          print("p4a.local_recipes = ./p4a-recipes")
+          print("Android ve Pygame ayarlari yazildi.")
           PYCONFIG
 
-          echo "----- Pygame tarifi -----"
-          sed -n '1,100p' "$PROJECT_DIR/p4a-recipes/pygame/__init__.py"
-
-          echo "----- Buildozer ayarlari -----"
-          grep -nE '^\s*(source\.dir|requirements|p4a\.branch|p4a\.local_recipes)\s*=' "$SPEC" || true
+          echo "----- Kontrol -----"
+          grep -nE '^(source\.dir|p4a\.branch|p4a\.local_recipes|android\.accept_sdk_license|android\.sdk_path|android\.ndk_path|android\.api|android\.minapi|android\.build_tools_version)\s*=' "$SPEC"
 
           test -f "$PROJECT_DIR/p4a-recipes/pygame/__init__.py"
 
-      - name: Install build tools
+      - name: Install Buildozer and Cython
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install "Cython>=3.1" "buildozer==1.5.0"
-
-          python -c "import Cython; print('Cython:', Cython.__version__)"
+          python -c "import Cython; print('Cython', Cython.__version__)"
           buildozer --version
 
-      - name: Clean old Android build cache
-        shell: bash
+      - name: Clean old build cache
         run: |
-          set -euo pipefail
           rm -rf "$PROJECT_DIR/.buildozer"
           rm -rf "$PROJECT_DIR/bin"
-          echo "Eski derleme onbellegi temizlendi."
 
-      - name: Build Sparta Arena APK
+      - name: Build APK
         shell: bash
         run: |
           set +e
           cd "$PROJECT_DIR"
           buildozer -v android debug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
-          BUILD_STATUS=${PIPESTATUS[0]}
+          RESULT=${PIPESTATUS[0]}
           set -e
-          exit "$BUILD_STATUS"
+          exit "$RESULT"
 
-      - name: Upload APK and build log
+      - name: Upload APK and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
