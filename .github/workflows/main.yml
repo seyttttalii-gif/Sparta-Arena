@@ -19,76 +19,166 @@ jobs:
       - name: Depoyu indir
         uses: actions/checkout@v4
 
-      - name: Java 17 kur
+      - name: Java kur
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Python 3.11 kur
+      - name: Python kur
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Gerekli paketleri kur
+      - name: Android derleme paketlerini kur
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            git zip unzip build-essential \
-            autoconf automake libtool pkg-config \
-            zlib1g-dev libncurses5-dev libncursesw5-dev \
-            libtinfo6 cmake libffi-dev libssl-dev \
-            libltdl-dev
+            git zip unzip \
+            build-essential autoconf automake libtool \
+            pkg-config zlib1g-dev libncurses5-dev \
+            libncursesw5-dev libtinfo6 cmake \
+            libffi-dev libssl-dev \
+            gettext libltdl-dev
 
-      - name: Proje ZIP dosyasini bul ve cikar
+      - name: Proje ZIP dosyasini bul ve ac
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' \
+            -not -path './.git/*' | head -n 1)"
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "HATA: Depoda proje ZIP dosyasi bulunamadi."
+            exit 1
+          fi
+
+          echo "ZIP bulundu: $ZIP_FILE"
+          mkdir -p "$GITHUB_WORKSPACE/unpacked"
+          unzip -q "$ZIP_FILE" -d "$GITHUB_WORKSPACE/unpacked"
+
+          echo "ZIP icerigi:"
+          find "$GITHUB_WORKSPACE/unpacked" -maxdepth 4 -type f \
+            \( -name 'main.py' -o -name 'buildozer.spec' \) -print
+
+      - name: Proje ve main.py konumunu otomatik bul
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP_FILE="$(find . -maxdepth 3 \
-            -type f -iname '*.zip' \
-            -not -path './.git/*' -print -quit)"
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "HATA: Proje ZIP dosyasi bulunamadi."
-            exit 1
-          fi
-
-          mkdir -p unpacked
-          echo "ZIP dosyasi: $ZIP_FILE"
-          unzip -q "$ZIP_FILE" -d unpacked
-
           SPEC="$(find "$GITHUB_WORKSPACE/unpacked" \
-            -name buildozer.spec -print -quit)"
+            -type f -name buildozer.spec \
+            -not -path '*/.buildozer/*' | head -n 1)"
 
           if [ -z "$SPEC" ]; then
             echo "HATA: buildozer.spec bulunamadi."
             exit 1
           fi
 
-          echo "PROJECT_DIR=$(dirname "$SPEC")" >> "$GITHUB_ENV"
+          PROJECT_DIR="$(dirname "$SPEC")"
+
+          MAIN_FILE="$(python - "$PROJECT_DIR" <<'PY'
+          import os
+          import sys
+
+          root = os.path.abspath(sys.argv[1])
+          excluded = {
+              ".git", ".buildozer", "bin", "venv",
+              ".venv", "__pycache__", "backend",
+              "tools", "tests", "test"
+          }
+
+          candidates = []
+
+          for current, dirs, files in os.walk(root):
+              dirs[:] = sorted(
+                  d for d in dirs
+                  if d not in excluded
+              )
+
+              if "main.py" in files:
+                  candidates.append(
+                      os.path.join(current, "main.py")
+                  )
+
+          if not candidates:
+              print(
+                  "HATA: Proje klasorunde uygun main.py bulunamadi.",
+                  file=sys.stderr
+              )
+              sys.exit(1)
+
+          def priority(path):
+              rel = os.path.relpath(path, root).replace("\\", "/")
+              if rel == "app/main.py":
+                  return (0, rel)
+              if rel == "main.py":
+                  return (1, rel)
+              return (2, rel)
+
+          candidates.sort(key=priority)
+          print(candidates[0])
+          PY
+          )"
+
+          MAIN_DIR="$(dirname "$MAIN_FILE")"
+          SOURCE_DIR="$(python -c \
+            'import os,sys; print(os.path.relpath(sys.argv[1],sys.argv[2]))' \
+            "$MAIN_DIR" "$PROJECT_DIR")"
+
+          echo "Proje: $PROJECT_DIR"
+          echo "Ana dosya: $MAIN_FILE"
+          echo "Kaynak dizini: $SOURCE_DIR"
+
+          test -f "$MAIN_FILE"
+
+          python - "$SPEC" "$SOURCE_DIR" <<'PY'
+          import re
+          import sys
+
+          spec_path, source_dir = sys.argv[1:3]
+
+          with open(spec_path, "r", encoding="utf-8") as f:
+              lines = f.readlines()
+
+          output = []
+          in_app = False
+          source_written = False
+
+          for line in lines:
+              section = re.match(r"^\s*\[([^\]]+)\]", line)
+
+              if section:
+                  if in_app and not source_written:
+                      output.append(f"source.dir = {source_dir}\n")
+                      source_written = True
+                  in_app = section.group(1).strip().lower() == "app"
+
+              if in_app and re.match(r"^\s*#?\s*source\.dir\s*=", line):
+                  if not source_written:
+                      output.append(f"source.dir = {source_dir}\n")
+                      source_written = True
+                  continue
+
+              output.append(line)
+
+          if in_app and not source_written:
+              output.append(f"source.dir = {source_dir}\n")
+
+          with open(spec_path, "w", encoding="utf-8") as f:
+              f.writelines(output)
+
+          print("buildozer.spec source.dir ayari:", source_dir)
+          PY
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "SPEC=$SPEC" >> "$GITHUB_ENV"
 
-      - name: Proje ve Pygame ayarlarini duzelt
+      - name: Pygame 2.6.1 tarifini hazirla
         shell: bash
         run: |
           set -euo pipefail
-
-          SPEC="$(find "$GITHUB_WORKSPACE/unpacked" \
-            -name buildozer.spec -print -quit)"
-          PROJECT_DIR="$(dirname "$SPEC")"
-
-          if [ ! -f "$PROJECT_DIR/app/main.py" ]; then
-            echo "HATA: app/main.py bulunamadi."
-            find "$PROJECT_DIR" -maxdepth 3 -type f | head -n 100
-            exit 1
-          fi
-
-          if [ ! -f "$PROJECT_DIR/app/save_manager.py" ]; then
-            echo "HATA: app/save_manager.py bulunamadi."
-            exit 1
-          fi
-
           mkdir -p "$PROJECT_DIR/p4a-recipes/pygame"
 
           cat > "$PROJECT_DIR/p4a-recipes/pygame/__init__.py" <<'PY'
@@ -106,100 +196,91 @@ jobs:
           PY
 
           python - "$SPEC" <<'PY'
-          from pathlib import Path
           import re
           import sys
 
-          path = Path(sys.argv[1])
-          lines = path.read_text(encoding="utf-8").splitlines()
+          path = sys.argv[1]
 
-          start = next(
-              (i for i, line in enumerate(lines)
-               if line.strip().lower() == "[app]"),
-              None
-          )
+          with open(path, "r", encoding="utf-8") as f:
+              lines = f.readlines()
 
-          if start is None:
-              raise SystemExit("HATA: [app] bolumu bulunamadi.")
+          settings = {
+              "p4a.branch": "v2024.01.21",
+              "p4a.local_recipes": "./p4a-recipes",
+          }
 
-          end = next(
-              (i for i in range(start + 1, len(lines))
-               if re.match(r"^\s*\[.+\]\s*$", lines[i])),
-              len(lines)
-          )
+          output = []
+          in_app = False
+          written = set()
 
-          def set_option(key, value):
-              pattern = re.compile(
-                  r"^\s*" + re.escape(key) + r"\s*=",
-                  re.IGNORECASE
-              )
+          for line in lines:
+              section = re.match(r"^\s*\[([^\]]+)\]", line)
 
-              for i in range(start + 1, end):
-                  if pattern.match(lines[i]) and not lines[i].lstrip().startswith("#"):
-                      lines[i] = f"{key} = {value}"
-                      return
+              if section:
+                  if in_app:
+                      for key, value in settings.items():
+                          if key not in written:
+                              output.append(f"{key} = {value}\n")
+                              written.add(key)
+                  in_app = section.group(1).strip().lower() == "app"
 
-              lines.insert(end, f"{key} = {value}")
+              matched = None
+              if in_app:
+                  for key in settings:
+                      if re.match(r"^\s*#?\s*" + re.escape(key) + r"\s*=", line):
+                          matched = key
+                          break
 
-          set_option("source.dir", "app")
-          set_option("p4a.branch", "v2024.01.21")
-          set_option("p4a.local_recipes", "./p4a-recipes")
+              if matched:
+                  if matched not in written:
+                      output.append(f"{matched} = {settings[matched]}\n")
+                      written.add(matched)
+                  continue
 
-          path.write_text(
-              "\n".join(lines) + "\n",
-              encoding="utf-8"
-          )
+              output.append(line)
 
-          print("Kaynak dizini: app")
-          print("Pygame yerel tarifi: 2.6.1")
-          print("python-for-android: v2024.01.21")
+          if in_app:
+              for key, value in settings.items():
+                  if key not in written:
+                      output.append(f"{key} = {value}\n")
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.writelines(output)
+
+          print("P4A ve yerel Pygame tarifi ayarlandi.")
           PY
 
-          echo "Guncel ayarlar:"
-          grep -E '^(source.dir|requirements|p4a.branch|p4a.local_recipes)' \
-            "$SPEC"
+          echo "buildozer.spec kontrolu:"
+          grep -E '^(source.dir|requirements|p4a.branch|p4a.local_recipes)[[:space:]]*=' "$SPEC" || true
 
-      - name: Buildozer ve Cython kur
+      - name: Buildozer kur
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install \
-            "buildozer==1.5.0" \
-            "Cython>=3.1,<4"
+          python -m pip install "Cython>=3.1,<4" "buildozer==1.5.0"
 
-      - name: Android SDK klasorlerini hazirla
-        run: |
-          mkdir -p "$HOME/.buildozer"
-          mkdir -p "$HOME/.android"
-          touch "$HOME/.android/repositories.cfg"
-
-      - name: Eski derleme onbellegini temizle
-        run: |
-          set -euo pipefail
-          rm -rf "$PROJECT_DIR/.buildozer"
-          rm -rf "$PROJECT_DIR/bin"
-          echo "Eski proje derleme dosyalari temizlendi."
-
-      - name: APK derle
+      - name: Sparta Arena APK derle
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           cd "$PROJECT_DIR"
 
-          if [ ! -f main.py ]; then
-            echo "HATA: app kaynak dizininde main.py bulunamadi."
-            exit 1
+          if [ ! -f "main.py" ] && [ -n "${SOURCE_DIR:-}" ]; then
+            :
           fi
 
+          rm -rf .buildozer bin
+
+          set -o pipefail
           (yes || true) | buildozer -v android debug 2>&1 \
             | tee "$GITHUB_WORKSPACE/build.log"
 
-      - name: APK ve derleme gunlugunu yukle
+      - name: APK ve hata kaydini yukle
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Sparta-Arena-APK
+          name: Sparta-Arena-APK-ve-Log
           path: |
             unpacked/**/bin/*.apk
             build.log
           if-no-files-found: warn
-          retention-days: 7
