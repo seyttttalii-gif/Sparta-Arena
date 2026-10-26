@@ -39,11 +39,11 @@ jobs:
             libncursesw5-dev libtinfo6 cmake libffi-dev libssl-dev \
             openjdk-17-jdk
 
-      - name: ZIP dosyasını bul ve çıkar
+      - name: ZIP dosyasini bul ve cikar
         run: |
           ZIP_FILE="$(find . -maxdepth 2 -type f -iname '*.zip' -print -quit)"
           if [ -z "$ZIP_FILE" ]; then
-            echo "HATA: Depoda ZIP dosyası bulunamadı."
+            echo "HATA: Depoda ZIP dosyasi bulunamadi."
             exit 1
           fi
 
@@ -52,41 +52,73 @@ jobs:
 
           SPEC="$(find unpacked -name buildozer.spec -print -quit)"
           if [ -z "$SPEC" ]; then
-            echo "HATA: ZIP içinde buildozer.spec bulunamadı."
+            echo "HATA: ZIP icinde buildozer.spec bulunamadi."
             exit 1
           fi
 
           echo "Proje bulundu: $SPEC"
+
+      - name: Pygame 2.6.1 yerel tarifini hazirla
+        run: |
+          set -e
+
+          SPEC="$(find "$GITHUB_WORKSPACE/unpacked" -name buildozer.spec -print -quit)"
+          PROJECT_DIR="$(dirname "$SPEC")"
+
+          mkdir -p "$PROJECT_DIR/p4a-recipes/pygame"
+
+          cat > "$PROJECT_DIR/p4a-recipes/pygame/__init__.py" <<'PY'
+          from pythonforandroid.recipes.pygame import Pygame2Recipe
+
+          class Pygame261Recipe(Pygame2Recipe):
+              version = "2.6.1"
+              url = "https://github.com/pygame/pygame/archive/{version}.tar.gz"
+              hostpython_prerequisites = ["setuptools", "cython>=3.1"]
+
+          recipe = Pygame261Recipe()
+          PY
+
+          python - "$SPEC" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          lines = path.read_text().splitlines()
+
+          if not any(line.strip().startswith("p4a.local_recipes") for line in lines):
+              requirements_index = next(
+                  i for i, line in enumerate(lines)
+                  if line.strip().startswith("requirements")
+              )
+              lines.insert(requirements_index + 1,
+                           "p4a.local_recipes = ./p4a-recipes")
+
+          path.write_text("\n".join(lines) + "\n")
+          print("Yerel tarif etkinlestirildi:", path)
+          PY
 
       - name: Buildozer kur
         run: |
           python -m pip install --upgrade pip
           pip install buildozer cython==0.29.37
 
-      - name: Android SDK lisanslarını kabul et
+      - name: Android SDK klasorlerini hazirla
         run: |
           mkdir -p "$HOME/.buildozer"
           mkdir -p "$HOME/.android"
           touch "$HOME/.android/repositories.cfg"
 
       - name: APK derle
-        env:
-          P4A_RELEASE_KEYSTORE: ""
         run: |
           set -o pipefail
 
           SPEC="$(find "$GITHUB_WORKSPACE/unpacked" -name buildozer.spec -print -quit)"
-          if [ -z "$SPEC" ]; then
-            echo "HATA: buildozer.spec bulunamadı."
-            exit 1
-          fi
-
           PROJECT_DIR="$(dirname "$SPEC")"
           cd "$PROJECT_DIR"
 
           yes | buildozer -v android debug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
-      - name: APK dosyasını yükle
+      - name: APK ve gunluk dosyalarini yukle
         if: always()
         uses: actions/upload-artifact@v4
         with:
