@@ -19,8 +19,7 @@ jobs:
       - name: Depoyu indir
         uses: actions/checkout@v4
 
-      - name: Log klasorunu hazirla
-        shell: bash
+      - name: Cikti klasorlerini hazirla
         run: |
           mkdir -p apk-output
           : > build.log
@@ -36,19 +35,18 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Android SDK icin yazilabilir klasor ayarla
+      - name: Android SDK yolunu ayarla
         shell: bash
         run: |
-          set -eux
-          SDK_DIR="$HOME/.android/sdk"
-          mkdir -p "$SDK_DIR"
-          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/.android/sdk"
+          echo "ANDROID_HOME=$HOME/.android/sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$HOME/.android/sdk" >> "$GITHUB_ENV"
+          echo "ANDROIDSDK=$HOME/.android/sdk" >> "$GITHUB_ENV"
 
       - name: Android SDK araclarini kur
         uses: android-actions/setup-android@v4
 
-      - name: SDK paketlerini ve eski Buildozer yolunu hazirla
+      - name: SDK ve avdmanager yolunu duzelt
         shell: bash
         run: |
           set -euxo pipefail
@@ -59,21 +57,42 @@ jobs:
             -print -quit 2>/dev/null || true)"
 
           if [ -z "$SDKMANAGER" ]; then
-            SDKMANAGER="$(command -v sdkmanager || true)"
-          fi
-
-          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
-            echo "HATA: Calistirilabilir sdkmanager bulunamadi."
+            echo "HATA: sdkmanager bulunamadi."
             find "$SDK" -maxdepth 7 -name sdkmanager -print || true
             exit 1
           fi
 
-          echo "Kullanilan SDK: $SDK"
-          echo "SDK araci: $SDKMANAGER"
-          "$SDKMANAGER" --version
+          SDK_TOOLS_BIN="$(dirname "$SDKMANAGER")"
+          SDK_TOOLS_VERSION_DIR="$(dirname "$SDK_TOOLS_BIN")"
+          AVDMANAGER="$SDK_TOOLS_BIN/avdmanager"
+
+          if [ ! -x "$AVDMANAGER" ]; then
+            echo "HATA: avdmanager bulunamadi veya calistirilamiyor."
+            find "$SDK/cmdline-tools" -name avdmanager -print || true
+            exit 1
+          fi
 
           mkdir -p "$SDK/tools/bin"
+
           ln -sfn "$SDKMANAGER" "$SDK/tools/bin/sdkmanager"
+          ln -sfn "$AVDMANAGER" "$SDK/tools/bin/avdmanager"
+
+          if [ ! -x "$SDK/cmdline-tools/latest/bin/avdmanager" ]; then
+            if [ -L "$SDK/cmdline-tools/latest" ]; then
+              rm -f "$SDK/cmdline-tools/latest"
+            elif [ -d "$SDK/cmdline-tools/latest" ]; then
+              mv "$SDK/cmdline-tools/latest" \
+                "$SDK/cmdline-tools/latest.previous"
+            fi
+
+            ln -s "$SDK_TOOLS_VERSION_DIR" \
+              "$SDK/cmdline-tools/latest"
+          fi
+
+          touch "$SDK/repositories.cfg"
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses \
+            >/dev/null || true
 
           "$SDKMANAGER" --sdk_root="$SDK" \
             "platform-tools" \
@@ -81,12 +100,18 @@ jobs:
             "build-tools;35.0.0" \
             "ndk;25.1.8937393"
 
-          test -x "$SDK/tools/bin/sdkmanager"
+          test -x "$SDK/cmdline-tools/latest/bin/avdmanager"
+          test -x "$SDK/tools/bin/avdmanager"
           test -d "$SDK/platforms/android-34"
           test -d "$SDK/build-tools/35.0.0"
           test -d "$SDK/ndk/25.1.8937393"
 
-      - name: Sistem paketlerini kur
+          echo "ANDROIDNDK=$SDK/ndk/25.1.8937393" \
+            >> "$GITHUB_ENV"
+
+          "$SDK/cmdline-tools/latest/bin/avdmanager" list target
+
+      - name: Sistem bagimliliklarini kur
         shell: bash
         run: |
           set -eux
@@ -98,7 +123,7 @@ jobs:
             libtinfo6 cmake libffi-dev libssl-dev \
             libltdl-dev
 
-      - name: Proje ZIP dosyasini ac
+      - name: Proje ZIP dosyasini bul ve ac
         shell: bash
         run: |
           set -eux
@@ -118,7 +143,6 @@ jobs:
             exit 1
           fi
 
-          echo "ZIP dosyasi: $ZIP_FILE"
           rm -rf unpacked
           mkdir -p unpacked
           unzip -oq "$ZIP_FILE" -d unpacked
@@ -145,11 +169,10 @@ jobs:
             "Cython>=3.1,<3.2" \
             "buildozer==1.5.0"
 
-          python --version
           cython --version
           buildozer --version
 
-      - name: Proje ayarlarini duzenle
+      - name: Buildozer ayarlarini duzenle
         shell: bash
         run: |
           set -eux
@@ -189,11 +212,10 @@ jobs:
               "source.include_exts":
                   "py,pyx,pxd,pyd,so,png,jpg,jpeg,bmp,gif,webp,"
                   "svg,atlas,ttf,otf,mp3,ogg,wav,flac,mid,midi,"
-                  "json,txt,dat,bin,ico",
+                  "json,txt,dat,bin,ico,mp4",
               "p4a.branch": "v2024.01.21",
               "p4a.local_recipes": "./p4a-recipes",
               "android.accept_sdk_license": "True",
-              "android.skip_update": "True",
               "android.sdk_path": os.environ["ANDROID_HOME"],
               "android.ndk_path": os.path.join(
                   os.environ["ANDROID_HOME"],
@@ -216,8 +238,7 @@ jobs:
           lines = lines[:start + 1] + section + lines[end:]
           spec.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-          print("Guncellenen Buildozer ayarlari:")
-          print(spec.read_text(encoding="utf-8"))
+          print("Buildozer ayarlari guncellendi.")
           PY
 
       - name: Pygame 2.6.1 Cython tarifini olustur
@@ -231,8 +252,9 @@ jobs:
           import glob
           import sh
 
+          from pythonforandroid.logger import shprint
           from pythonforandroid.recipes.pygame import Pygame2Recipe
-          from pythonforandroid.toolchain import current_directory, shprint
+          from pythonforandroid.util import current_directory
 
           class Pygame261Recipe(Pygame2Recipe):
               version = "2.6.1"
@@ -240,15 +262,12 @@ jobs:
                   "https://github.com/pygame/pygame/"
                   "archive/refs/tags/{version}.tar.gz"
               )
-              hostpython_prerequisites = [
-                  "setuptools",
-                  "cython>=3.1,<3.2",
-              ]
 
               def build_compiled_components(self, arch):
                   env = self.get_recipe_env(arch)
                   build_dir = self.get_build_dir(arch.arch)
                   hostpython = sh.Command(self.hostpython_location)
+                  cython = sh.Command("cython")
 
                   with current_directory(build_dir):
                       try:
@@ -258,57 +277,63 @@ jobs:
                               "build_ext",
                               _env=env
                           )
-                      except sh.ErrorReturnCode:
+                      except sh.ErrorReturnCode_1:
                           print(
-                              "Ilk build_ext denemesi basarisiz oldu; "
-                              "Cython dosyalari simdi olusturulacak.",
+                              "Host Python Cython olmadan derleyemedi; "
+                              "Cython dosyalari olusturuluyor.",
                               flush=True
+                          )
+
+                          pyx_files = glob.glob(
+                              "**/*.pyx", recursive=True
+                          )
+
+                          if not pyx_files:
+                              raise RuntimeError(
+                                  "Pygame kaynaklarinda .pyx dosyasi "
+                                  "bulunamadi."
+                              )
+
+                          for pyx_file in pyx_files:
+                              shprint(
+                                  cython, "-3", pyx_file, _env=env
+                              )
+
+                          shprint(
+                              hostpython,
+                              "setup.py",
+                              "build_ext",
+                              "-v",
+                              _env=env
+                          )
+
+                      build_lib = glob.glob("build/lib.*")
+                      if not build_lib:
+                          raise RuntimeError(
+                              "Pygame derlendi ancak build/lib klasoru "
+                              "olusturulamadi."
                           )
 
                       shprint(
                           sh.find,
-                          build_dir,
-                          "-iname",
-                          "*.pyx",
+                          build_lib[0],
+                          "-name",
+                          "*.o",
                           "-exec",
-                          self.ctx.cython,
+                          env["STRIP"],
                           "{}",
                           ";",
                           _env=env
                       )
 
-                      shprint(
-                          hostpython,
-                          "setup.py",
-                          "build_ext",
-                          "-v",
-                          _env=env
-                      )
-
-                      built_dirs = glob.glob("build/lib.*")
-                      if built_dirs and env.get("STRIP"):
-                          shprint(
-                              sh.find,
-                              built_dirs[0],
-                              "-name",
-                              "*.o",
-                              "-exec",
-                              env["STRIP"],
-                              "{}",
-                              ";",
-                              _env=env
-                          )
-
           recipe = Pygame261Recipe()
           PY
 
           python -m py_compile p4a-recipes/pygame/__init__.py
-          echo "Pygame Cython tarifi hazir."
 
-      - name: Eski derleme ciktilarini temizle
+      - name: Eski derleme dosyalarini temizle
         shell: bash
         run: |
-          set -eux
           cd "$PROJECT_DIR"
           rm -rf .buildozer bin
 
@@ -327,11 +352,10 @@ jobs:
 
           if ! find "$GITHUB_WORKSPACE/apk-output" \
             -maxdepth 1 -type f -name '*.apk' | grep -q .; then
-            echo "HATA: Derleme sonrasi APK dosyasi bulunamadi."
+            echo "HATA: Derleme sonrasi APK bulunamadi."
             exit 1
           fi
 
-          echo "APK dosyalari:"
           ls -lh "$GITHUB_WORKSPACE/apk-output"
 
       - name: APK dosyasini yukle
