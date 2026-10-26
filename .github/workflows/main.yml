@@ -4,8 +4,7 @@ name: Sparta Arena APK Build
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
 
 permissions:
   contents: read
@@ -30,8 +29,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Android derleme araçlarını kur
+      - name: Android araçlarını kur ve lisansları kabul et
+        shell: bash
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y \
             git zip unzip build-essential autoconf automake \
@@ -39,154 +40,79 @@ jobs:
             libncursesw5-dev libtinfo6 cmake libffi-dev \
             libssl-dev libltdl-dev
 
-      - name: Projeyi ZIP dosyasından çıkar
+      - name: Proje ZIP dosyasını çıkar
         shell: bash
         run: |
           set -e
           ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' | head -n 1)"
-          if [ -z "$ZIP_FILE" ]; then
-            echo "HATA: Depoda ZIP dosyası bulunamadı."
+          test -n "$ZIP_FILE" || {
+            echo "HATA: Proje ZIP dosyası bulunamadı."
             exit 1
-          fi
-          echo "ZIP: $ZIP_FILE"
+          }
+
           mkdir -p unpacked
           unzip -q "$ZIP_FILE" -d unpacked
+
           SPEC="$(find unpacked -name buildozer.spec -print -quit)"
-          if [ -z "$SPEC" ]; then
-            echo "HATA: ZIP içinde buildozer.spec bulunamadı."
-            find unpacked -maxdepth 4 -type f | head -n 100
+          test -n "$SPEC" || {
+            echo "HATA: buildozer.spec bulunamadı."
             exit 1
-          fi
+          }
+
           PROJECT_DIR="$(dirname "$SPEC")"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "SPEC=$SPEC" >> "$GITHUB_ENV"
-          echo "Proje klasörü: $PROJECT_DIR"
-          find "$PROJECT_DIR" -maxdepth 3 -name main.py -print
 
-      - name: Pygame yerel tarifini oluştur
-        shell: bash
-        run: |
-          set -e
-          mkdir -p "$PROJECT_DIR/p4a-recipes/pygame"
-          cat > "$PROJECT_DIR/p4a-recipes/pygame/__init__.py" <<'PY'
-          from os.path import join, exists
-          import glob
-
-          import sh
-          from pythonforandroid.recipes.pygame import Pygame2Recipe
-          from pythonforandroid.toolchain import current_directory, shprint
-
-          class Pygame261Recipe(Pygame2Recipe):
-              version = "2.6.1"
-              url = "https://github.com/pygame/pygame/archive/{version}.tar.gz"
-              hostpython_prerequisites = ["setuptools", "Cython>=3.1,<4"]
-
-              def build_arch(self, arch):
-                  env = self.get_recipe_env(arch)
-                  build_dir = self.get_build_dir(arch.arch)
-
-                  with current_directory(build_dir):
-                      hostpython = sh.Command(self.ctx.hostpython)
-
-                      try:
-                          shprint(
-                              hostpython,
-                              "setup.py",
-                              "build_ext",
-                              _env=env
-                          )
-                      except sh.ErrorReturnCode:
-                          pass
-
-                      pyx_files = glob.glob(
-                          join(build_dir, "**", "*.pyx"),
-                          recursive=True
-                      )
-
-                      for pyx in pyx_files:
-                          shprint(self.ctx.cython, pyx, _env=env)
-
-                      shprint(
-                          hostpython,
-                          "setup.py",
-                          "build_ext",
-                          "-v",
-                          _env=env
-                      )
-
-                      build_lib_dirs = glob.glob(
-                          join(build_dir, "build", "lib*")
-                      )
-                      if build_lib_dirs:
-                          for obj in glob.glob(
-                              join(build_lib_dirs[0], "**", "*.o"),
-                              recursive=True
-                          ):
-                              shprint(
-                                  sh.find,
-                                  obj,
-                                  "-maxdepth",
-                                  "0",
-                                  _env=env
-                              )
-
-                  super().build_arch(arch)
-
-          recipe = Pygame261Recipe()
-          PY
-
-      - name: Buildozer kur
+      - name: Buildozer ve Cython kur
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install "Cython>=3.1,<4" "buildozer==1.5.0"
+
+      - name: Android SDK lisanslarını kabul et ve paketleri kur
+        shell: bash
+        run: |
+          set -e
+          SDK="$HOME/.buildozer/android/platform/android-sdk"
+          mkdir -p "$SDK"
+
+          if [ -x "$SDK/tools/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK/tools/bin/sdkmanager"
+          elif [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          else
+            echo "SDK Manager henüz Buildozer tarafından indirilmemiş."
+            echo "Lisans ve paket kurulumu Buildozer aşamasında yapılacak."
+            exit 0
+          fi
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses || true
+          "$SDKMANAGER" --sdk_root="$SDK" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;37.0.0"
 
       - name: Buildozer ayarlarını düzenle
         shell: bash
         run: |
           set -e
-          python - "$SPEC" "$PROJECT_DIR" <<'PY'
+          python - "$SPEC" <<'PY'
           import configparser
-          import os
           import sys
 
-          spec_path, project_dir = sys.argv[1:3]
-          config = configparser.ConfigParser(
+          path = sys.argv[1]
+          c = configparser.ConfigParser(
               interpolation=None,
               strict=False
           )
-          config.optionxform = str
-          config.read(spec_path)
+          c.optionxform = str
+          c.read(path)
 
-          if not config.has_section("app"):
-              raise SystemExit("HATA: buildozer.spec içinde [app] bölümü yok.")
+          a = c["app"]
+          a["p4a.branch"] = "v2024.01.21"
+          a["android.accept_sdk_license"] = "True"
 
-          app = config["app"]
-
-          main_candidates = []
-          for root, dirs, files in os.walk(project_dir):
-              dirs[:] = [
-                  d for d in dirs
-                  if d not in (".git", ".buildozer", "bin", "__pycache__")
-              ]
-              if "main.py" in files:
-                  main_candidates.append(os.path.relpath(root, project_dir))
-
-          if not main_candidates:
-              raise SystemExit("HATA: Proje içinde main.py bulunamadı.")
-
-          source_dir = main_candidates[0]
-          app["source.dir"] = source_dir
-          app["orientation"] = "landscape"
-          app["requirements"] = "python3,pygame"
-          app["p4a.branch"] = "v2024.01.21"
-          app["p4a.local_recipes"] = "./p4a-recipes"
-
-          with open(spec_path, "w", encoding="utf-8") as f:
-              config.write(f)
-
-          print("source.dir =", source_dir)
-          print("p4a.branch =", app["p4a.branch"])
-          print("p4a.local_recipes =", app["p4a.local_recipes"])
+          with open(path, "w", encoding="utf-8") as f:
+              c.write(f)
           PY
 
       - name: APK derle
@@ -194,30 +120,14 @@ jobs:
         run: |
           set -o pipefail
           cd "$PROJECT_DIR"
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          set +e
           buildozer -v android debug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
-          BUILD_STATUS=${PIPESTATUS[0]}
-          set -e
-          if [ "$BUILD_STATUS" -ne 0 ]; then
-            echo "APK derlemesi başarısız. Son hata satırları:"
-            grep -niE \
-              'error:|exception|failed|not found|traceback|cython' \
-              "$GITHUB_WORKSPACE/build.log" | tail -n 100 || true
-            exit "$BUILD_STATUS"
-          fi
-          find bin -type f -name '*.apk' -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \;
-          if ! find "$GITHUB_WORKSPACE/artifacts" -type f -name '*.apk' | grep -q .; then
-            echo "HATA: Derleme tamamlandı ancak APK bulunamadı."
-            exit 1
-          fi
 
-      - name: APK ve derleme günlüğünü yükle
+      - name: APK dosyasını yükle
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Sparta-Arena-APK
           path: |
-            artifacts/*.apk
+            unpacked/**/bin/*.apk
             build.log
           if-no-files-found: warn
