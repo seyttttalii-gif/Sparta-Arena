@@ -19,126 +19,89 @@ jobs:
       - name: Depoyu indir
         uses: actions/checkout@v4
 
-      - name: Java kur
-        uses: actions/setup-java@v5
+      - name: Java 17 kur
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Python kur
+      - name: Python 3.11 kur
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Gerekli paketleri kur
+      - name: Android derleme bağımlılıklarını kur
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git zip unzip build-essential autoconf automake \
-            libtool pkg-config zlib1g-dev libncurses5-dev \
-            libncursesw5-dev libtinfo6 cmake libffi-dev libssl-dev
+            git zip unzip \
+            build-essential \
+            autoconf automake libtool \
+            pkg-config zlib1g-dev \
+            libncurses5-dev libncursesw5-dev \
+            libtinfo6 cmake \
+            libffi-dev libssl-dev \
+            libltdl-dev
 
-      - name: ZIP dosyasini bul ve cikar
+      - name: Proje ZIP dosyasını bul ve çıkar
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          ZIP_FILE="$(find . -maxdepth 2 -type f -iname '*.zip' -print -quit)"
+          ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' \
+            -not -path './.git/*' | head -n 1)"
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "HATA: Depoda ZIP dosyasi bulunamadi."
+            echo "HATA: Depoda proje ZIP dosyası bulunamadı."
             exit 1
           fi
 
+          echo "ZIP dosyası: $ZIP_FILE"
           mkdir -p unpacked
           unzip -q "$ZIP_FILE" -d unpacked
+
+          echo "Bulunan Buildozer dosyaları:"
+          find unpacked -name buildozer.spec -print
 
           SPEC="$(find unpacked -name buildozer.spec -print -quit)"
 
           if [ -z "$SPEC" ]; then
-            echo "HATA: ZIP icinde buildozer.spec bulunamadi."
+            echo "HATA: ZIP içinde buildozer.spec bulunamadı."
+            echo "ZIP içeriğini kontrol et."
             exit 1
           fi
 
-          echo "Proje bulundu: $SPEC"
+          echo "PROJECT_DIR=$(dirname "$SPEC")" >> "$GITHUB_ENV"
 
-      - name: Pygame 2.6.1 yerel tarifini hazirla
+      - name: Buildozer ve Python paketlerini kur
         run: |
-          set -e
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install "Cython==0.29.36" "buildozer==1.5.0"
 
-          SPEC="$(find "$GITHUB_WORKSPACE/unpacked" -name buildozer.spec -print -quit)"
-
-          if [ -z "$SPEC" ]; then
-            echo "HATA: buildozer.spec bulunamadi."
-            exit 1
-          fi
-
-          PROJECT_DIR="$(dirname "$SPEC")"
-
-          mkdir -p "$PROJECT_DIR/p4a-recipes/pygame"
-
-          cat > "$PROJECT_DIR/p4a-recipes/pygame/__init__.py" <<'PY'
-          from pythonforandroid.recipes.pygame import Pygame2Recipe
-
-          class Pygame261Recipe(Pygame2Recipe):
-              version = "2.6.1"
-              url = "https://github.com/pygame/pygame/archive/{version}.tar.gz"
-              hostpython_prerequisites = ["setuptools", "cython>=3.1"]
-
-          recipe = Pygame261Recipe()
-          PY
-
-          python - "$SPEC" <<'PY'
-          from pathlib import Path
-          import sys
-
-          path = Path(sys.argv[1])
-          lines = path.read_text().splitlines()
-
-          if not any(line.strip().startswith("p4a.local_recipes") for line in lines):
-              index = next(
-                  i for i, line in enumerate(lines)
-                  if line.strip().startswith("requirements")
-              )
-              lines.insert(index + 1, "p4a.local_recipes = ./p4a-recipes")
-
-          path.write_text("\n".join(lines) + "\n")
-          print("Pygame yerel tarifi etkinlestirildi.")
-          PY
-
-      - name: Buildozer kur
+      - name: Android SDK ve NDK ile APK derle
+        working-directory: ${{ github.workspace }}
         run: |
-          python -m pip install --upgrade pip
-          pip install buildozer cython==0.29.37
-
-      - name: Android SDK klasorlerini hazirla
-        run: |
-          mkdir -p "$HOME/.buildozer"
-          mkdir -p "$HOME/.android"
-          touch "$HOME/.android/repositories.cfg"
-
-      - name: APK derle
-        run: |
-          set -e
-          set -o pipefail
-
-          SPEC="$(find "$GITHUB_WORKSPACE/unpacked" -name buildozer.spec -print -quit)"
-
-          if [ -z "$SPEC" ]; then
-            echo "HATA: buildozer.spec bulunamadi."
-            exit 1
-          fi
-
-          PROJECT_DIR="$(dirname "$SPEC")"
+          set -euo pipefail
           cd "$PROJECT_DIR"
 
-          yes | buildozer -v android debug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          echo "Proje dizini: $PWD"
+          echo "Buildozer ayarları:"
+          grep -E '^(title|package.name|package.domain|source.dir|source.include_exts|version|requirements|orientation|android.api|android.minapi|android.ndk)' buildozer.spec || true
 
-      - name: APK ve gunluk dosyalarini yukle
+          if [ ! -f main.py ]; then
+            echo "HATA: Proje dizininde main.py bulunamadı."
+            find . -maxdepth 3 -type f | head -n 100
+            exit 1
+          fi
+
+          buildozer -v android debug
+
+      - name: APK dosyasını yükle
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Sparta-Arena-APK
           path: |
-            unpacked/**/bin/*.apk
-            build.log
+            **/bin/*.apk
           if-no-files-found: warn
+          retention-days: 7
