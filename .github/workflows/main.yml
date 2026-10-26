@@ -30,78 +30,219 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Android derleme bağımlılıklarını kur
+      - name: Gerekli paketleri kur
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git zip unzip \
-            build-essential \
-            autoconf automake libtool \
-            pkg-config zlib1g-dev \
-            libncurses5-dev libncursesw5-dev \
-            libtinfo6 cmake \
-            libffi-dev libssl-dev \
+            git zip unzip build-essential \
+            autoconf automake libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev \
+            libtinfo6 cmake libffi-dev libssl-dev \
             libltdl-dev
 
-      - name: Proje ZIP dosyasını bul ve çıkar
+      - name: ZIP dosyasini bul ve cikar
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' \
-            -not -path './.git/*' | head -n 1)"
+          ZIP_FILE="$(find . -maxdepth 3 \
+            -type f -iname '*.zip' \
+            -not -path './.git/*' \
+            -print -quit)"
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "HATA: Depoda proje ZIP dosyası bulunamadı."
+            echo "HATA: Depoda proje ZIP dosyasi bulunamadi."
             exit 1
           fi
 
-          echo "ZIP dosyası: $ZIP_FILE"
+          echo "ZIP: $ZIP_FILE"
           mkdir -p unpacked
           unzip -q "$ZIP_FILE" -d unpacked
 
-          echo "Bulunan Buildozer dosyaları:"
-          find unpacked -name buildozer.spec -print
-
-          SPEC="$(find unpacked -name buildozer.spec -print -quit)"
+          SPEC="$(find "$GITHUB_WORKSPACE/unpacked" \
+            -name buildozer.spec -print -quit)"
 
           if [ -z "$SPEC" ]; then
-            echo "HATA: ZIP içinde buildozer.spec bulunamadı."
-            echo "ZIP içeriğini kontrol et."
+            echo "HATA: ZIP icinde buildozer.spec bulunamadi."
             exit 1
           fi
 
-          echo "PROJECT_DIR=$(dirname "$SPEC")" >> "$GITHUB_ENV"
+          PROJECT_DIR="$(dirname "$SPEC")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Proje bulundu: $PROJECT_DIR"
 
-      - name: Buildozer ve Python paketlerini kur
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install "Cython==0.29.36" "buildozer==1.5.0"
-
-      - name: Android SDK ve NDK ile APK derle
-        working-directory: ${{ github.workspace }}
+      - name: Python ve Pygame ayarlarini duzelt
+        shell: bash
         run: |
           set -euo pipefail
+
+          SPEC="$(find "$GITHUB_WORKSPACE/unpacked" \
+            -name buildozer.spec -print -quit)"
+
+          PROJECT_DIR="$(dirname "$SPEC")"
+
+          python - "$SPEC" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path(sys.argv[1])
+          lines = path.read_text(encoding="utf-8").splitlines()
+
+          start = next(
+              (i for i, line in enumerate(lines)
+               if line.strip().lower() == "[app]"),
+              None
+          )
+
+          if start is None:
+              raise SystemExit("HATA: buildozer.spec icinde [app] yok.")
+
+          end = next(
+              (i for i in range(start + 1, len(lines))
+               if lines[i].strip().startswith("[")
+               and lines[i].strip().endswith("]")),
+              len(lines)
+          )
+
+          req_index = next(
+              (i for i in range(start + 1, end)
+               if re.match(r"^\s*requirements\s*=", lines[i])
+               and not lines[i].lstrip().startswith("#")),
+              None
+          )
+
+          if req_index is None:
+              raise SystemExit("HATA: requirements ayari bulunamadi.")
+
+          value = lines[req_index].split("=", 1)[1].strip()
+          existing = [
+              item.strip() for item in value.split(",")
+              if item.strip()
+          ]
+
+          # Eski Python ve Pygame surumlerini kaldir,
+          # diger uygulama bagimliliklarini koru.
+          kept = [
+              item for item in existing
+              if not re.match(
+                  r"^(python3|hostpython3|pygame)(==.*)?$",
+                  item,
+                  re.IGNORECASE
+              )
+          ]
+
+          requirements = [
+              "python3==3.10.12",
+              "hostpython3==3.10.12",
+              "pygame",
+              *kept
+          ]
+
+          lines[req_index] = (
+              "requirements = " + ",".join(requirements)
+          )
+
+          def set_app_option(key, value):
+              pattern = re.compile(
+                  r"^\s*" + re.escape(key) + r"\s*=",
+                  re.IGNORECASE
+              )
+              for i in range(start + 1, end):
+                  if pattern.match(lines[i]) and not lines[i].lstrip().startswith("#"):
+                      lines[i] = f"{key} = {value}"
+                      return
+              lines.insert(end, f"{key} = {value}")
+
+          set_app_option("p4a.branch", "master")
+          set_app_option("p4a.local_recipes", "./p4a-recipes")
+
+          path.write_text(
+              "\n".join(lines) + "\n",
+              encoding="utf-8"
+          )
+
+          print("Python hedefi: 3.10.12")
+          print("Requirements:", ",".join(requirements))
+          print("python-for-android branch: master")
+          print("Yerel Pygame tarifi etkin.")
+          PY
+
+          mkdir -p "$PROJECT_DIR/p4a-recipes/pygame"
+
+          cat > "$PROJECT_DIR/p4a-recipes/pygame/__init__.py" <<'PY'
+          from pythonforandroid.recipes.pygame import Pygame2Recipe
+
+          class Pygame261Recipe(Pygame2Recipe):
+              version = "2.6.1"
+              url = "https://github.com/pygame/pygame/archive/{version}.tar.gz"
+              hostpython_prerequisites = [
+                  "setuptools",
+                  "cython>=3.1,<4"
+              ]
+
+          recipe = Pygame261Recipe()
+          PY
+
+          echo "Duzeltilmis buildozer.spec:"
+          grep -E '^(requirements|p4a.branch|p4a.local_recipes)' \
+            "$SPEC"
+
+      - name: Buildozer kur
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install \
+            "buildozer==1.5.0" \
+            "Cython>=0.29.36,<4"
+
+      - name: Android SDK klasorlerini hazirla
+        run: |
+          mkdir -p "$HOME/.buildozer"
+          mkdir -p "$HOME/.android"
+          touch "$HOME/.android/repositories.cfg"
+
+      - name: Eski derleme onbellegini temizle
+        run: |
+          set -euo pipefail
+
+          echo "Proje: $PROJECT_DIR"
+
+          # ZIP icerisinden gelmis olabilecek eski
+          # Python 3.14 derleme dosyalarini kaldir.
+          rm -rf "$PROJECT_DIR/.buildozer"
+          rm -rf "$PROJECT_DIR/bin"
+
+          echo "Eski proje derleme onbellegi temizlendi."
+
+      - name: APK derle
+        shell: bash
+        run: |
+          set -euo pipefail
+
           cd "$PROJECT_DIR"
 
-          echo "Proje dizini: $PWD"
-          echo "Buildozer ayarları:"
-          grep -E '^(title|package.name|package.domain|source.dir|source.include_exts|version|requirements|orientation|android.api|android.minapi|android.ndk)' buildozer.spec || true
-
           if [ ! -f main.py ]; then
-            echo "HATA: Proje dizininde main.py bulunamadı."
+            echo "HATA: main.py proje dizininde bulunamadi."
             find . -maxdepth 3 -type f | head -n 100
             exit 1
           fi
 
-          buildozer -v android debug
+          echo "Python hedefi ve requirements:"
+          grep -E '^(requirements|p4a.branch|p4a.local_recipes)' \
+            buildozer.spec
 
-      - name: APK dosyasını yükle
+          echo "APK derlemesi basliyor..."
+
+          (yes || true) | buildozer -v android debug 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: APK ve gunluk dosyalarini yukle
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Sparta-Arena-APK
           path: |
-            **/bin/*.apk
+            unpacked/**/bin/*.apk
+            build.log
           if-no-files-found: warn
           retention-days: 7
