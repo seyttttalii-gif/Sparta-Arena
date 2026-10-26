@@ -38,24 +38,37 @@ jobs:
             libncursesw5-dev libtinfo6 cmake libffi-dev libssl-dev
 
       - name: Android SDK araçlarını kur
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+          log-accepted-android-sdk-licenses: 'false'
 
-      - name: Android SDK yolunu sabitle ve paketleri yükle
+      - name: Android SDK ve NDK paketlerini kur
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          SDKMANAGER="$(find "${ANDROID_HOME:-$HOME/.android/sdk}" \
-            /usr/local/lib/android/sdk \
-            -type f -path '*/cmdline-tools/*/bin/sdkmanager' \
-            -print -quit 2>/dev/null || true)"
+          SDKMANAGER="$(command -v sdkmanager || true)"
 
           if [ -z "$SDKMANAGER" ]; then
-            echo "HATA: Android sdkmanager bulunamadı."
+            SDKMANAGER="$(find \
+              /usr/local/lib/android/sdk \
+              "$HOME/.android/sdk" \
+              -type f -path '*/cmdline-tools/*/bin/sdkmanager' \
+              -print -quit 2>/dev/null || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "HATA: sdkmanager bulunamadı."
             exit 1
           fi
 
           SDK_ROOT="${SDKMANAGER%%/cmdline-tools/*}"
+
+          if [ "$SDK_ROOT" = "$SDKMANAGER" ]; then
+            echo "HATA: Android SDK dizini belirlenemedi."
+            exit 1
+          fi
 
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
@@ -63,18 +76,28 @@ jobs:
           echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
           echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
 
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses || true
+          yes | "$SDKMANAGER" \
+            --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
 
           "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
             "platform-tools" \
-            "platforms;android-34" \
+            "platforms;android-35" \
             "build-tools;35.0.0" \
-            "ndk;25.1.8937393"
+            "ndk;27.3.13750724"
 
-          echo "Android SDK yolu: $SDK_ROOT"
+          if [ ! -x "$SDK_ROOT/ndk/27.3.13750724/ndk-build" ]; then
+            echo "HATA: NDK kurulumu tamamlanmadı."
+            exit 1
+          fi
+
+          echo "ANDROID_NDK=$SDK_ROOT/ndk/27.3.13750724" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/27.3.13750724" >> "$GITHUB_ENV"
+          echo "ANDROIDNDK=$SDK_ROOT/ndk/27.3.13750724" >> "$GITHUB_ENV"
           echo "SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
 
-      - name: Proje ZIP dosyasını aç
+          echo "SDK ve NDK hazır: $SDK_ROOT"
+
+      - name: Proje ZIP dosyasını bul ve aç
         shell: bash
         run: |
           set -euo pipefail
@@ -84,11 +107,12 @@ jobs:
             -print -quit)"
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "HATA: Depoda proje ZIP dosyası bulunamadı."
+            echo "HATA: Proje ZIP dosyası bulunamadı."
             exit 1
           fi
 
-          echo "Bulunan ZIP: $ZIP_FILE"
+          echo "Proje ZIP dosyası: $ZIP_FILE"
+
           mkdir -p unpacked
           unzip -oq "$ZIP_FILE" -d unpacked
 
@@ -104,40 +128,19 @@ jobs:
           echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
           echo "Proje dizini: $PROJECT"
 
-      - name: Pygame ve PyJNIus tariflerini hazırla
+      - name: Pygame derleme tarifini hazırla
         shell: bash
         run: |
           set -euo pipefail
 
           PROJECT="$(dirname "$(find unpacked -name buildozer.spec -print -quit)")"
-
-          mkdir -p "$PROJECT/p4a-recipes/pyjnius"
           mkdir -p "$PROJECT/p4a-recipes/pygame"
 
-          # PyJNIus 1.7.0, eski "long" Cython hatasını düzeltir.
-          cat > "$PROJECT/p4a-recipes/pyjnius/__init__.py" <<'PY'
-          from pythonforandroid.recipes.pyjnius import (
-              PyjniusRecipe as BasePyjniusRecipe
-          )
-
-          class Pyjnius170Recipe(BasePyjniusRecipe):
-              version = "1.7.0"
-              url = "https://github.com/kivy/pyjnius/archive/{version}.zip"
-              hostpython_prerequisites = [
-                  "setuptools",
-                  "Cython>=3.1,<3.2",
-              ]
-
-          recipe = Pyjnius170Recipe()
-          PY
-
-          # ZIP içinde Pygame tarifi yoksa Cython derlemesini destekleyen
-          # Pygame 2.6.1 tarifi oluştur.
           if [ ! -f "$PROJECT/p4a-recipes/pygame/__init__.py" ]; then
             cat > "$PROJECT/p4a-recipes/pygame/__init__.py" <<'PY'
           import sh
           from pythonforandroid.recipes.pygame import Pygame2Recipe
-          from pythonforandroid.util import current_directory, shprint
+          from pythonforandroid.toolchain import current_directory, shprint
 
           class Pygame261Recipe(Pygame2Recipe):
               version = "2.6.1"
@@ -154,36 +157,23 @@ jobs:
                       hostpython = sh.Command(self.ctx.hostpython)
 
                       try:
-                          shprint(
-                              hostpython,
-                              "setup.py",
-                              "build_ext",
-                              _env=env,
-                          )
+                          shprint(hostpython, "setup.py", "build_ext", _env=env)
                       except sh.ErrorReturnCode_1:
                           print(
-                              "İlk Cython derlemesi başarısız oldu; "
-                              "PYX dosyaları hazırlanacak.",
+                              "İlk derleme Cython nedeniyle durdu; "
+                              "PYX dosyaları hazırlanıyor.",
                               flush=True,
                           )
 
                       shprint(
-                          sh.find,
-                          ".",
-                          "-iname",
-                          "*.pyx",
-                          "-exec",
-                          self.ctx.cython,
-                          "{}",
-                          ";",
+                          sh.find, ".",
+                          "-iname", "*.pyx",
+                          "-exec", self.ctx.cython, "{}", ";",
                           _env=env,
                       )
 
                       shprint(
-                          hostpython,
-                          "setup.py",
-                          "build_ext",
-                          "-v",
+                          hostpython, "setup.py", "build_ext", "-v",
                           _env=env,
                       )
 
@@ -191,30 +181,83 @@ jobs:
           PY
           fi
 
-          # Buildozer ayarlarında yerel tarifleri ve p4a sürümünü sabitle.
-          if grep -qE '^[[:space:]]*p4a.branch[[:space:]]*=' "$PROJECT/buildozer.spec"; then
-            sed -i -E \
-              's|^[[:space:]]*p4a.branch[[:space:]]*=.*|p4a.branch = v2024.01.21|' \
-              "$PROJECT/buildozer.spec"
-          else
-            sed -i '/^\[app\]/a p4a.branch = v2024.01.21' \
-              "$PROJECT/buildozer.spec"
-          fi
+          # Önceki yerel PyJNIus tarifi eski 1.6.1 tarifini temel alıyordu.
+          # P4A develop, PyJNIus 1.7.0 için güncel tarifi kendi içinde sağlar.
+          rm -rf "$PROJECT/p4a-recipes/pyjnius"
 
-          if grep -qE '^[[:space:]]*p4a.local_recipes[[:space:]]*=' "$PROJECT/buildozer.spec"; then
-            sed -i -E \
-              's|^[[:space:]]*p4a.local_recipes[[:space:]]*=.*|p4a.local_recipes = ./p4a-recipes|' \
-              "$PROJECT/buildozer.spec"
-          else
-            sed -i '/^\[app\]/a p4a.local_recipes = ./p4a-recipes' \
-              "$PROJECT/buildozer.spec"
-          fi
+          echo "Yerel tarifler:"
+          find "$PROJECT/p4a-recipes" -maxdepth 2 -name __init__.py -print
 
-          echo "PyJNIus tarifi:"
-          grep -E 'version|url|Cython' "$PROJECT/p4a-recipes/pyjnius/__init__.py"
+      - name: Buildozer ayarlarını düzenle
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          echo "Pygame tarifi:"
-          grep -E 'version|url|Cython' "$PROJECT/p4a-recipes/pygame/__init__.py"
+          python - "$PROJECT_DIR/buildozer.spec" <<'PY'
+          import os
+          import re
+          import sys
+
+          spec = sys.argv[1]
+
+          with open(spec, "r", encoding="utf-8") as file:
+              lines = file.readlines()
+
+          start = next(
+              (i for i, line in enumerate(lines)
+               if line.strip().lower() == "[app]"),
+              None,
+          )
+
+          if start is None:
+              raise SystemExit("HATA: buildozer.spec içinde [app] bölümü yok.")
+
+          end = len(lines)
+          for i in range(start + 1, len(lines)):
+              if re.match(r"^\s*\[.+\]\s*$", lines[i]):
+                  end = i
+                  break
+
+          sdk = os.environ["ANDROID_HOME"]
+          settings = {
+              "android.sdk_path": sdk,
+              "android.ndk_path": os.path.join(
+                  sdk, "ndk", "27.3.13750724"
+              ),
+              "android.api": "35",
+              "android.minapi": "24",
+              "android.build_tools_version": "35.0.0",
+              "android.accept_sdk_license": "True",
+              "p4a.branch": "develop",
+              "p4a.local_recipes": "./p4a-recipes",
+          }
+
+          section = lines[start + 1:end]
+
+          for key, value in settings.items():
+              pattern = re.compile(
+                  r"^\s*" + re.escape(key) + r"\s*="
+              )
+              found = False
+
+              for i, line in enumerate(section):
+                  if pattern.match(line):
+                      section[i] = f"{key} = {value}\n"
+                      found = True
+                      break
+
+              if not found:
+                  section.append(f"{key} = {value}\n")
+
+          lines[start + 1:end] = section
+
+          with open(spec, "w", encoding="utf-8") as file:
+              file.writelines(lines)
+
+          print("Buildozer ayarları güncellendi.")
+          print("SDK:", sdk)
+          print("P4A: develop")
+          PY
 
       - name: Buildozer ve Cython kur
         run: |
@@ -229,29 +272,21 @@ jobs:
           set -o pipefail
           cd "$PROJECT_DIR"
 
-          export ANDROID_HOME="${ANDROID_HOME:-$HOME/.android/sdk}"
+          export ANDROID_HOME
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
           export ANDROIDSDK="$ANDROID_HOME"
-          export ANDROIDNDK="$ANDROID_HOME/ndk/25.1.8937393"
+          export ANDROIDNDK="$ANDROID_HOME/ndk/27.3.13750724"
           export ANDROID_NDK="$ANDROIDNDK"
           export ANDROID_NDK_HOME="$ANDROIDNDK"
-          export ANDROIDAPI=34
+          export ANDROIDAPI=35
           export ANDROIDMINAPI=24
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
 
-          if [ ! -x "$ANDROID_HOME/ndk/25.1.8937393/ndk-build" ]; then
-            echo "HATA: Beklenen Android NDK bulunamadı:"
-            echo "$ANDROID_HOME/ndk/25.1.8937393"
-            exit 1
-          fi
-
-          # Önceki başarısız derlemenin önbelleğini kullanma.
-          rm -rf .buildozer
-
-          echo "Proje: $PWD"
+          echo "Proje dizini: $PWD"
           echo "SDK: $ANDROID_HOME"
           echo "NDK: $ANDROIDNDK"
-          echo "APK derlemesi başlıyor..."
+
+          rm -rf .buildozer
 
           buildozer -v android debug 2>&1 \
             | tee "$GITHUB_WORKSPACE/build.log"
