@@ -36,12 +36,14 @@ jobs:
           sudo apt-get install -y \
             git zip unzip build-essential autoconf automake \
             libtool pkg-config zlib1g-dev libncurses5-dev \
-            libncursesw5-dev libtinfo6 cmake libffi-dev libssl-dev \
-            openjdk-17-jdk
+            libncursesw5-dev libtinfo6 cmake libffi-dev libssl-dev
 
       - name: ZIP dosyasini bul ve cikar
         run: |
+          set -e
+
           ZIP_FILE="$(find . -maxdepth 2 -type f -iname '*.zip' -print -quit)"
+
           if [ -z "$ZIP_FILE" ]; then
             echo "HATA: Depoda ZIP dosyasi bulunamadi."
             exit 1
@@ -51,6 +53,7 @@ jobs:
           unzip -q "$ZIP_FILE" -d unpacked
 
           SPEC="$(find unpacked -name buildozer.spec -print -quit)"
+
           if [ -z "$SPEC" ]; then
             echo "HATA: ZIP icinde buildozer.spec bulunamadi."
             exit 1
@@ -63,6 +66,12 @@ jobs:
           set -e
 
           SPEC="$(find "$GITHUB_WORKSPACE/unpacked" -name buildozer.spec -print -quit)"
+
+          if [ -z "$SPEC" ]; then
+            echo "HATA: buildozer.spec bulunamadi."
+            exit 1
+          fi
+
           PROJECT_DIR="$(dirname "$SPEC")"
 
           mkdir -p "$PROJECT_DIR/p4a-recipes/pygame"
@@ -86,15 +95,14 @@ jobs:
           lines = path.read_text().splitlines()
 
           if not any(line.strip().startswith("p4a.local_recipes") for line in lines):
-              requirements_index = next(
+              index = next(
                   i for i, line in enumerate(lines)
                   if line.strip().startswith("requirements")
               )
-              lines.insert(requirements_index + 1,
-                           "p4a.local_recipes = ./p4a-recipes")
+              lines.insert(index + 1, "p4a.local_recipes = ./p4a-recipes")
 
           path.write_text("\n".join(lines) + "\n")
-          print("Yerel tarif etkinlestirildi:", path)
+          print("Pygame yerel tarifi etkinlestirildi.")
           PY
 
       - name: Buildozer kur
@@ -110,9 +118,16 @@ jobs:
 
       - name: APK derle
         run: |
+          set -e
           set -o pipefail
 
           SPEC="$(find "$GITHUB_WORKSPACE/unpacked" -name buildozer.spec -print -quit)"
+
+          if [ -z "$SPEC" ]; then
+            echo "HATA: buildozer.spec bulunamadi."
+            exit 1
+          fi
+
           PROJECT_DIR="$(dirname "$SPEC")"
           cd "$PROJECT_DIR"
 
