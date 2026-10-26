@@ -1,0 +1,133 @@
+name: Sparta Arena Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Depoyu indir
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Sparta Arena PC dosyalarını kontrol et
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $zip = Join-Path $env:GITHUB_WORKSPACE "SpartaArena_PC.zip"
+
+          if (!(Test-Path $zip)) {
+            throw "SpartaArena_PC.zip bulunamadı. Önce ZIP dosyasını depoya yükle."
+          }
+
+          $source = Join-Path $env:RUNNER_TEMP "SpartaArenaSource"
+          New-Item -ItemType Directory -Path $source -Force | Out-Null
+
+          Expand-Archive -LiteralPath $zip -DestinationPath $source -Force
+
+          $main = Get-ChildItem $source -Filter "main.py" -Recurse -File |
+            Select-Object -First 1
+
+          if (!$main) {
+            throw "ZIP içinde main.py bulunamadı."
+          }
+
+          "SOURCE_DIR=$($main.Directory.FullName)" >> $env:GITHUB_ENV
+          "MAIN_FILE=$($main.FullName)" >> $env:GITHUB_ENV
+
+          Write-Host "Oyun kodu bulundu: $($main.FullName)"
+
+      - name: Pygame ve PyInstaller kur
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) {
+            throw "pip güncellenemedi."
+          }
+
+          python -m pip install pygame==2.6.1 pyinstaller
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pygame veya PyInstaller kurulamadı."
+          }
+
+          python -m py_compile "$env:MAIN_FILE"
+          if ($LASTEXITCODE -ne 0) {
+            throw "main.py içinde Python sözdizimi hatası var."
+          }
+
+      - name: Windows EXE oluştur
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $work = Join-Path $env:RUNNER_TEMP "SpartaBuild"
+          $spec = Join-Path $env:RUNNER_TEMP "SpartaSpec"
+          $log = Join-Path $env:GITHUB_WORKSPACE "windows-build.log"
+
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+
+          Push-Location $env:SOURCE_DIR
+          try {
+            & python -m PyInstaller `
+              --noconfirm `
+              --clean `
+              --onefile `
+              --windowed `
+              --name SpartaArena `
+              --collect-all pygame `
+              --distpath $dist `
+              --workpath $work `
+              --specpath $spec `
+              "$env:MAIN_FILE" 2>&1 |
+              Tee-Object -FilePath $log
+
+            $code = $LASTEXITCODE
+          }
+          finally {
+            Pop-Location
+          }
+
+          if ($code -ne 0) {
+            throw "Windows EXE derlemesi başarısız oldu."
+          }
+
+          $exe = Join-Path $dist "SpartaArena.exe"
+
+          if (!(Test-Path $exe)) {
+            throw "Derleme bitti ancak SpartaArena.exe bulunamadı."
+          }
+
+          Compress-Archive `
+            -Path $exe `
+            -DestinationPath (Join-Path $env:GITHUB_WORKSPACE "SpartaArena-Windows.zip") `
+            -Force
+
+          Write-Host "Windows EXE başarıyla oluşturuldu."
+
+      - name: Windows paketini ve günlüğü kaydet
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sparta-Arena-Windows
+          path: |
+            SpartaArena-Windows.zip
+            windows-build.log
+          if-no-files-found: warn
+          retention-days: 7
