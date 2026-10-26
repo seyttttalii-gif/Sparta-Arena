@@ -4,7 +4,8 @@ name: Sparta Arena APK Build
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -29,90 +30,147 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Android araçlarını kur ve lisansları kabul et
+      - name: Sistem paketlerini kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip curl \
+            build-essential autoconf automake \
+            libtool pkg-config zlib1g-dev \
+            libncurses5-dev libncursesw5-dev \
+            libtinfo6 cmake libffi-dev \
+            libssl-dev libltdl-dev
+
+      - name: Android SDK Manager kur
         shell: bash
         run: |
           set -e
-          sudo apt-get update
-          sudo apt-get install -y \
-            git zip unzip build-essential autoconf automake \
-            libtool pkg-config zlib1g-dev libncurses5-dev \
-            libncursesw5-dev libtinfo6 cmake libffi-dev \
-            libssl-dev libltdl-dev
+
+          SDK="$HOME/.buildozer/android/platform/android-sdk"
+          TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip"
+
+          mkdir -p "$SDK/cmdline-tools" "$SDK/tools/bin"
+          rm -rf "$SDK/cmdline-tools/latest"
+
+          mkdir -p /tmp/android-cli
+          curl -fL "$TOOLS_URL" -o /tmp/android-cli.zip
+          unzip -q /tmp/android-cli.zip -d /tmp/android-cli
+
+          mkdir -p "$SDK/cmdline-tools/latest"
+          cp -a /tmp/android-cli/cmdline-tools/. \
+            "$SDK/cmdline-tools/latest/"
+
+          cat > "$SDK/tools/bin/sdkmanager" <<'SH'
+          #!/usr/bin/env bash
+          set -e
+          SDK_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+          exec "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$@"
+          SH
+
+          chmod +x "$SDK/tools/bin/sdkmanager"
+          test -x "$SDK/tools/bin/sdkmanager"
+
+          yes | "$SDK/tools/bin/sdkmanager" \
+            --sdk_root="$SDK" --licenses || true
+
+          "$SDK/tools/bin/sdkmanager" \
+            --sdk_root="$SDK" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;37.0.0"
 
       - name: Proje ZIP dosyasını çıkar
         shell: bash
         run: |
           set -e
+
           ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' | head -n 1)"
-          test -n "$ZIP_FILE" || {
-            echo "HATA: Proje ZIP dosyası bulunamadı."
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "HATA: Depoda proje ZIP dosyası bulunamadı."
             exit 1
-          }
+          fi
 
           mkdir -p unpacked
           unzip -q "$ZIP_FILE" -d unpacked
 
           SPEC="$(find unpacked -name buildozer.spec -print -quit)"
-          test -n "$SPEC" || {
-            echo "HATA: buildozer.spec bulunamadı."
+
+          if [ -z "$SPEC" ]; then
+            echo "HATA: ZIP içinde buildozer.spec bulunamadı."
             exit 1
-          }
-
-          PROJECT_DIR="$(dirname "$SPEC")"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "SPEC=$SPEC" >> "$GITHUB_ENV"
-
-      - name: Buildozer ve Cython kur
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install "Cython>=3.1,<4" "buildozer==1.5.0"
-
-      - name: Android SDK lisanslarını kabul et ve paketleri kur
-        shell: bash
-        run: |
-          set -e
-          SDK="$HOME/.buildozer/android/platform/android-sdk"
-          mkdir -p "$SDK"
-
-          if [ -x "$SDK/tools/bin/sdkmanager" ]; then
-            SDKMANAGER="$SDK/tools/bin/sdkmanager"
-          elif [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
-            SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          else
-            echo "SDK Manager henüz Buildozer tarafından indirilmemiş."
-            echo "Lisans ve paket kurulumu Buildozer aşamasında yapılacak."
-            exit 0
           fi
 
-          yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses || true
-          "$SDKMANAGER" --sdk_root="$SDK" \
-            "platform-tools" \
-            "platforms;android-36" \
-            "build-tools;37.0.0"
+          PROJECT_DIR="$(dirname "$SPEC")"
+
+          echo "SPEC=$SPEC" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Proje: $PROJECT_DIR"
+          find "$PROJECT_DIR" -maxdepth 4 -name main.py -print
+
+      - name: Buildozer kur
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install "Cython<4" "buildozer==1.5.0"
 
       - name: Buildozer ayarlarını düzenle
         shell: bash
         run: |
           set -e
-          python - "$SPEC" <<'PY'
+
+          python - "$SPEC" "$PROJECT_DIR" <<'PY'
           import configparser
+          import os
           import sys
 
-          path = sys.argv[1]
-          c = configparser.ConfigParser(
+          spec_path, project_dir = sys.argv[1:3]
+
+          config = configparser.ConfigParser(
               interpolation=None,
               strict=False
           )
-          c.optionxform = str
-          c.read(path)
+          config.optionxform = str
+          config.read(spec_path)
 
-          a = c["app"]
-          a["p4a.branch"] = "v2024.01.21"
-          a["android.accept_sdk_license"] = "True"
+          if not config.has_section("app"):
+              raise SystemExit("HATA: buildozer.spec içinde [app] yok.")
 
-          with open(path, "w", encoding="utf-8") as f:
-              c.write(f)
+          app = config["app"]
+
+          main_dirs = []
+
+          for root, dirs, files in os.walk(project_dir):
+              dirs[:] = [
+                  d for d in dirs
+                  if d not in (
+                      ".git", ".buildozer", "bin", "__pycache__"
+                  )
+              ]
+
+              if "main.py" in files:
+                  main_dirs.append(
+                      os.path.relpath(root, project_dir)
+                  )
+
+          if not main_dirs:
+              raise SystemExit("HATA: Proje içinde main.py bulunamadı.")
+
+          app["source.dir"] = main_dirs[0]
+          app["requirements"] = "python3,pygame"
+          app["orientation"] = "landscape"
+          app["p4a.branch"] = "v2024.01.21"
+          app["p4a.local_recipes"] = ""
+          app["android.accept_sdk_license"] = "True"
+          app["android.api"] = "36"
+          app["android.minapi"] = "24"
+
+          with open(spec_path, "w", encoding="utf-8") as f:
+              config.write(f)
+
+          print("source.dir =", app["source.dir"])
+          print("requirements =", app["requirements"])
+          print("p4a.branch =", app["p4a.branch"])
           PY
 
       - name: APK derle
@@ -120,14 +178,27 @@ jobs:
         run: |
           set -o pipefail
           cd "$PROJECT_DIR"
-          buildozer -v android debug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
-      - name: APK dosyasını yükle
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          buildozer -v android debug \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+          find bin -type f -name '*.apk' \
+            -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \;
+
+          if ! find "$GITHUB_WORKSPACE/artifacts" \
+            -type f -name '*.apk' | grep -q .; then
+            echo "HATA: Derleme bitti ama APK bulunamadı."
+            exit 1
+          fi
+
+      - name: APK ve günlük dosyasını yükle
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Sparta-Arena-APK
           path: |
-            unpacked/**/bin/*.apk
+            artifacts/*.apk
             build.log
           if-no-files-found: warn
