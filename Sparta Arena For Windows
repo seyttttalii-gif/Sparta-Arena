@@ -1,0 +1,229 @@
+
+name: Sparta Arena Windows Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Depoyu indir
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Windows oyunu derle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repo = $env:GITHUB_WORKSPACE
+          $log = Join-Path $repo "windows-build.log"
+          New-Item -ItemType File -Path $log -Force | Out-Null
+
+          try {
+            $zip = Get-ChildItem $repo -Filter "*.zip" -File |
+              Where-Object {
+                $_.Name -like "*SPARTA_ARENA_V57*"
+              } |
+              Select-Object -First 1
+
+            if (-not $zip) {
+              throw "Proje ZIP dosyası bulunamadı."
+            }
+
+            $work = Join-Path $env:RUNNER_TEMP "sparta-windows"
+            $sourceRoot = Join-Path $work "source"
+
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
+
+            Expand-Archive -LiteralPath $zip.FullName `
+              -DestinationPath $sourceRoot -Force
+
+            $spec = Get-ChildItem $sourceRoot -Filter "buildozer.spec" `
+              -Recurse -File | Select-Object -First 1
+
+            if (-not $spec) {
+              throw "buildozer.spec bulunamadı."
+            }
+
+            $project = $spec.Directory.FullName
+            $specLines = Get-Content $spec.FullName
+
+            $sourceLine = $specLines |
+              Where-Object { $_ -match '^\s*source\.dir\s*=' } |
+              Select-Object -First 1
+
+            $sourceDir = $null
+
+            if ($sourceLine) {
+              $relativeSource = ($sourceLine -split '=', 2)[1].Trim()
+              $sourceDir = [System.IO.Path]::GetFullPath(
+                (Join-Path $project $relativeSource)
+              )
+            } elseif (Test-Path (Join-Path $project "app\main.py")) {
+              $sourceDir = Join-Path $project "app"
+            } else {
+              $sourceDir = $project
+            }
+
+            $entry = Join-Path $sourceDir "main.py"
+
+            if (-not (Test-Path $entry)) {
+              $candidate = Get-ChildItem $project -Filter "main.py" `
+                -Recurse -File |
+                Where-Object {
+                  $_.FullName -notmatch '[\\/](\.buildozer|build|dist|\.git)[\\/]'
+                } |
+                Select-Object -First 1
+
+              if ($candidate) {
+                $entry = $candidate.FullName
+                $sourceDir = $candidate.Directory.FullName
+              }
+            }
+
+            if (-not (Test-Path $entry)) {
+              throw "Oyunun main.py giriş dosyası bulunamadı."
+            }
+
+            Add-Content $log "Proje: $project"
+            Add-Content $log "Oyun dosyası: $entry"
+
+            Write-Host "Proje: $project"
+            Write-Host "Oyun giriş dosyası: $entry"
+
+            python -m pip install --upgrade pip
+            if ($LASTEXITCODE -ne 0) {
+              throw "pip güncellenemedi."
+            }
+
+            python -m pip install "pygame==2.6.1" "pyinstaller>=6,<7"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Pygame veya PyInstaller kurulamadı."
+            }
+
+            $distRoot = Join-Path $work "dist"
+            $buildRoot = Join-Path $work "pyinstaller-build"
+            $specRoot = Join-Path $work "pyinstaller-spec"
+            New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
+
+            $pyArgs = @(
+              "--noconfirm",
+              "--clean",
+              "--onedir",
+              "--windowed",
+              "--name", "SpartaArena",
+              "--distpath", $distRoot,
+              "--workpath", $buildRoot,
+              "--specpath", $specRoot,
+              "--collect-all", "pygame"
+            )
+
+            $skipNames = @(
+              ".git", ".buildozer", "__pycache__",
+              "build", "dist", "bin", "p4a-recipes"
+            )
+
+            foreach ($item in Get-ChildItem $sourceDir -Force) {
+              if ($skipNames -contains $item.Name) {
+                continue
+              }
+
+              if ($item.Name -eq "buildozer.spec") {
+                continue
+              }
+
+              if (-not $item.PSIsContainer -and
+                  $item.Extension -eq ".py") {
+                continue
+              }
+
+              if ($item.PSIsContainer) {
+                $destination = $item.Name
+              } else {
+                $destination = "."
+              }
+
+              $pyArgs += @(
+                "--add-data",
+                "$($item.FullName);$destination"
+              )
+            }
+
+            $pyArgs += $entry
+
+            Push-Location $sourceDir
+            try {
+              & python -m PyInstaller @pyArgs 2>&1 |
+                Tee-Object -FilePath $log -Append
+
+              if ($LASTEXITCODE -ne 0) {
+                throw "PyInstaller derlemesi başarısız oldu."
+              }
+            } finally {
+              Pop-Location
+            }
+
+            $appOut = Join-Path $distRoot "SpartaArena"
+            $exe = Join-Path $appOut "SpartaArena.exe"
+
+            if (-not (Test-Path $exe)) {
+              throw "Derleme bitti ama EXE dosyası bulunamadı."
+            }
+
+            foreach ($item in Get-ChildItem $sourceDir -Force) {
+              if ($skipNames -contains $item.Name) {
+                continue
+              }
+
+              if ($item.Name -eq "buildozer.spec") {
+                continue
+              }
+
+              Copy-Item -LiteralPath $item.FullName `
+                -Destination $appOut -Recurse -Force
+            }
+
+            @'
+          @echo off
+          cd /d "%~dp0"
+          start "" "%~dp0SpartaArena.exe"
+          '@ | Set-Content `
+            -Path (Join-Path $appOut "SpartaArena.bat") `
+            -Encoding ASCII
+
+            $archive = Join-Path $repo "SpartaArena-Windows.zip"
+
+            Compress-Archive `
+              -Path (Join-Path $appOut "*") `
+              -DestinationPath $archive -Force
+
+            Add-Content $log "Windows paketi oluşturuldu: $archive"
+            Write-Host "Windows paketi oluşturuldu."
+          }
+          catch {
+            Add-Content $log $_.ToString()
+            Write-Host $_.ToString()
+            throw
+          }
+
+      - name: Windows paketini ve günlüğü kaydet
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sparta-Arena-Windows
+          path: |
+            SpartaArena-Windows.zip
+            windows-build.log
+          if-no-files-found: warn
+          retention-days: 7
