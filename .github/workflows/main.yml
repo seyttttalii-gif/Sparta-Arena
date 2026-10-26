@@ -1,5 +1,247 @@
 
-      - name: Pygame 2.6.1 Cython tarifini olustur
+name: Sparta Arena APK Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Depoyu indir
+        uses: actions/checkout@v4
+
+      - name: Cikti klasorlerini hazirla
+        shell: bash
+        run: |
+          mkdir -p apk-output
+          : > build.log
+
+      - name: Java 17 kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Python 3.11 kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Android SDK yolunu ayarla
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.android/sdk"
+          echo "ANDROID_HOME=$HOME/.android/sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$HOME/.android/sdk" >> "$GITHUB_ENV"
+          echo "ANDROIDSDK=$HOME/.android/sdk" >> "$GITHUB_ENV"
+
+      - name: Android SDK kur
+        uses: android-actions/setup-android@v4
+
+      - name: SDK araclarini, lisanslari ve eski yollari duzelt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SDK="$ANDROID_HOME"
+          SDKMANAGER="$(find "$SDK/cmdline-tools" \
+            -type f -name sdkmanager -path '*/bin/sdkmanager' \
+            -print -quit 2>/dev/null || true)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "HATA: sdkmanager bulunamadi."
+            find "$SDK" -maxdepth 7 -name sdkmanager -print || true
+            exit 1
+          fi
+
+          CMDLINE_BIN="$(dirname "$SDKMANAGER")"
+          CMDLINE_DIR="$(dirname "$CMDLINE_BIN")"
+          LATEST="$SDK/cmdline-tools/latest"
+
+          if [ "$CMDLINE_DIR" != "$LATEST" ]; then
+            if [ -L "$LATEST" ]; then
+              rm -f "$LATEST"
+            elif [ -d "$LATEST" ]; then
+              rm -rf "$LATEST"
+            fi
+            ln -s "$CMDLINE_DIR" "$LATEST"
+          fi
+
+          mkdir -p "$SDK/tools/bin"
+          ln -sfn "$SDKMANAGER" "$SDK/tools/bin/sdkmanager"
+          ln -sfn "$LATEST/bin/avdmanager" "$SDK/tools/bin/avdmanager"
+
+          touch "$SDK/repositories.cfg"
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses \
+            >/dev/null || true
+
+          "$SDKMANAGER" --sdk_root="$SDK" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;35.0.0" \
+            "ndk;25.1.8937393"
+
+          test -x "$LATEST/bin/sdkmanager"
+          test -x "$LATEST/bin/avdmanager"
+          test -d "$SDK/platforms/android-34"
+          test -d "$SDK/build-tools/35.0.0"
+          test -d "$SDK/ndk/25.1.8937393"
+
+          echo "ANDROIDNDK=$SDK/ndk/25.1.8937393" >> "$GITHUB_ENV"
+          echo "SDK ve Android araclari hazir."
+
+          "$LATEST/bin/avdmanager" list target
+
+      - name: Sistem bagimliliklarini kur
+        shell: bash
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip build-essential \
+            autoconf automake libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev \
+            libtinfo6 cmake libffi-dev libssl-dev \
+            libltdl-dev
+
+      - name: Proje ZIP dosyasini bul ve ac
+        shell: bash
+        run: |
+          set -eux
+
+          ZIP_FILE="$(find . -maxdepth 3 -type f \
+            -name 'SPARTA_ARENA_V57_ANDROID_READY.zip' \
+            -not -path './.git/*' -print -quit)"
+
+          if [ -z "$ZIP_FILE" ]; then
+            ZIP_FILE="$(find . -maxdepth 3 -type f \
+              -iname '*.zip' -not -path './.git/*' \
+              -print -quit)"
+          fi
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "HATA: Proje ZIP dosyasi bulunamadi."
+            exit 1
+          fi
+
+          echo "ZIP dosyasi: $ZIP_FILE"
+          rm -rf unpacked
+          mkdir -p unpacked
+          unzip -oq "$ZIP_FILE" -d unpacked
+
+          SPEC="$(find unpacked -name buildozer.spec -print -quit)"
+
+          if [ -z "$SPEC" ]; then
+            echo "HATA: ZIP icinde buildozer.spec bulunamadi."
+            find unpacked -maxdepth 5 -type f | head -200
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SPEC")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Proje klasoru: $PROJECT_DIR"
+          find "$PROJECT_DIR" -maxdepth 3 -type f | head -200
+
+      - name: Buildozer ve Cython kur
+        shell: bash
+        run: |
+          set -eux
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install \
+            "Cython>=3.1,<3.2" \
+            "buildozer==1.5.0"
+
+          python --version
+          cython --version
+          buildozer --version
+
+      - name: Buildozer ayarlarini duzenle
+        shell: bash
+        run: |
+          set -eux
+          cd "$PROJECT_DIR"
+
+          python - <<'PY'
+          from pathlib import Path
+          import os
+
+          spec = Path("buildozer.spec")
+          lines = spec.read_text(encoding="utf-8").splitlines()
+
+          if "[app]" not in lines:
+              raise SystemExit("HATA: [app] bolumu bulunamadi.")
+
+          start = lines.index("[app]")
+          end = next(
+              (
+                  i for i in range(start + 1, len(lines))
+                  if lines[i].strip().startswith("[")
+                  and lines[i].strip().endswith("]")
+              ),
+              len(lines)
+          )
+
+          section = lines[start + 1:end]
+
+          if Path("app/main.py").is_file():
+              source_dir = "app"
+          elif Path("main.py").is_file():
+              source_dir = "."
+          else:
+              raise SystemExit(
+                  "HATA: app/main.py veya main.py bulunamadi."
+              )
+
+          settings = {
+              "source.dir": source_dir,
+              "source.include_exts":
+                  "py,pyx,pxd,pyd,so,png,jpg,jpeg,bmp,gif,webp,"
+                  "svg,atlas,ttf,otf,mp3,ogg,wav,flac,mid,midi,"
+                  "json,txt,dat,bin,ico,mp4",
+              "p4a.branch": "v2024.01.21",
+              "p4a.local_recipes": "./p4a-recipes",
+              "android.accept_sdk_license": "True",
+              "android.sdk_path": os.environ["ANDROID_HOME"],
+              "android.ndk_path": os.path.join(
+                  os.environ["ANDROID_HOME"],
+                  "ndk",
+                  "25.1.8937393"
+              ),
+              "android.api": "34",
+              "android.minapi": "24",
+              "android.build_tools_version": "35.0.0",
+              "android.archs": "arm64-v8a",
+          }
+
+          for key, value in settings.items():
+              section = [
+                  line for line in section
+                  if not line.strip().startswith(key + " =")
+              ]
+              section.append(f"{key} = {value}")
+
+          lines = lines[:start + 1] + section + lines[end:]
+          spec.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          print("buildozer.spec ayarlari guncellendi.")
+          PY
+
+      - name: Pygame 2.6.1 icin Cython tarifini hazirla
         shell: bash
         run: |
           set -eux
@@ -8,7 +250,7 @@
 
           cat > p4a-recipes/pygame/__init__.py <<'PY'
           import glob
-          import os
+          from pathlib import Path
           import sh
 
           from pythonforandroid.logger import shprint
@@ -24,48 +266,37 @@
 
               def build_compiled_components(self, arch):
                   env = self.get_recipe_env(arch)
-                  build_dir = self.get_build_dir(arch.arch)
-                  hostpython = sh.Command(self.hostpython_location)
+                  build_dir = Path(self.get_build_dir(arch.arch))
+                  cython_root = Path("src_c/cython/pygame")
                   cython = sh.Command("cython")
+                  hostpython = sh.Command(self.hostpython_location)
 
-                  with current_directory(build_dir):
-                      pyx_files = sorted(set(
-                          glob.glob(
-                              "src_c/cython/pygame/*.pyx"
+                  with current_directory(str(build_dir)):
+                      if not cython_root.is_dir():
+                          raise RuntimeError(
+                              "Pygame Cython kaynak klasoru bulunamadi: "
+                              + str(cython_root)
                           )
-                          + glob.glob(
-                              "src_c/cython/pygame/**/*.pyx",
-                              recursive=True
-                          )
-                      ))
+
+                      pyx_files = sorted(cython_root.rglob("*.pyx"))
 
                       if not pyx_files:
                           raise RuntimeError(
-                              "Pygame .pyx kaynak dosyalari bulunamadi."
+                              "Pygame icinde .pyx dosyasi bulunamadi."
                           )
 
                       print(
-                          f"Toplam {len(pyx_files)} Cython dosyasi "
-                          "derlenecek.",
+                          f"Cython kaynak dosyasi sayisi: {len(pyx_files)}",
                           flush=True
                       )
 
-                      for pyx_file in pyx_files:
-                          parts = os.path.splitext(
-                              pyx_file
-                          )[0].split(os.path.sep)
-
-                          # Pygame'in bekledigi C cikti yolunu kullan.
-                          del parts[1:3]
-                          c_file = os.path.sep.join(parts) + ".c"
-
-                          os.makedirs(
-                              os.path.dirname(c_file),
-                              exist_ok=True
-                          )
+                      for source in pyx_files:
+                          relative = source.relative_to(cython_root)
+                          output = Path("src_c") / relative.with_suffix(".c")
+                          output.parent.mkdir(parents=True, exist_ok=True)
 
                           print(
-                              f"Cython: {pyx_file} -> {c_file}",
+                              f"Olusturuluyor: {output}",
                               flush=True
                           )
 
@@ -74,25 +305,26 @@
                               "-3",
                               "-I", "src_c/cython",
                               "-I", "src_c/cython/pygame",
-                              pyx_file,
-                              "-o", c_file,
+                              str(source),
+                              "-o", str(output),
                               _env=env
                           )
 
-                      required_c_files = [
-                          "src_c/pypm.c",
-                          "src_c/_sdl2/audio.c",
+                      required = [
+                          Path("src_c/pypm.c"),
+                          Path("src_c/_sdl2/audio.c"),
                       ]
 
-                      for filename in required_c_files:
-                          if not os.path.isfile(filename):
+                      for filename in required:
+                          if not filename.is_file():
                               raise RuntimeError(
-                                  f"Gerekli C dosyasi olusmadi: {filename}"
+                                  "Cython gerekli C dosyasini "
+                                  "olusturamadi: " + str(filename)
                               )
 
                       print(
-                          "Gerekli C dosyalari olustu. "
-                          "Host Python ile Pygame derleniyor.",
+                          "Kontrol tamam: pypm.c ve _sdl2/audio.c mevcut. "
+                          "Host Python ile derleme basliyor.",
                           flush=True
                       )
 
@@ -107,26 +339,56 @@
                       build_dirs = glob.glob("build/lib.*")
                       if not build_dirs:
                           raise RuntimeError(
-                              "Pygame build_ext tamamlandi ancak "
+                              "Pygame build_ext tamamlanmadi: "
                               "build/lib klasoru bulunamadi."
-                          )
-
-                      strip_command = env.get("STRIP", "").split()
-                      if strip_command:
-                          shprint(
-                              sh.find,
-                              build_dirs[0],
-                              "-name", "*.o",
-                              "-exec",
-                              strip_command[0],
-                              "--strip-unneeded",
-                              "{}",
-                              ";",
-                              _env=env
                           )
 
           recipe = Pygame261Recipe()
           PY
 
           python -m py_compile p4a-recipes/pygame/__init__.py
-          echo "Pygame tarifi hazir."
+          echo "Pygame Cython tarifi hazir."
+
+      - name: Eski derleme dosyalarini temizle
+        shell: bash
+        run: |
+          set -eux
+          cd "$PROJECT_DIR"
+          rm -rf .buildozer bin
+
+      - name: APK derle ve log kaydet
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$PROJECT_DIR"
+
+          buildozer -v android debug 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build.log"
+
+          find "$PROJECT_DIR/bin" -maxdepth 1 \
+            -type f -name '*.apk' \
+            -exec cp {} "$GITHUB_WORKSPACE/apk-output/" \;
+
+          if ! find "$GITHUB_WORKSPACE/apk-output" \
+            -maxdepth 1 -type f -name '*.apk' | grep -q .; then
+            echo "HATA: Derleme bitti ama APK bulunamadi."
+            exit 1
+          fi
+
+          ls -lh "$GITHUB_WORKSPACE/apk-output"
+
+      - name: APK dosyasini yukle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sparta-Arena-APK
+          path: apk-output/*.apk
+          if-no-files-found: warn
+
+      - name: Derleme gunlugunu yukle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sparta-Arena-Build-Log
+          path: build.log
+          if-no-files-found: warn
